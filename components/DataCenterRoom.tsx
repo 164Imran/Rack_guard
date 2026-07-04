@@ -13,6 +13,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Bot,
+  BadgeEuro,
   Check,
   CheckCircle2,
   CircleAlert,
@@ -20,6 +21,7 @@ import {
   Gauge,
   Layers3,
   Lightbulb,
+  LoaderCircle,
   Mic,
   Play,
   Radio,
@@ -31,9 +33,14 @@ import {
   Thermometer,
   TriangleAlert
 } from "lucide-react";
+import RoiDecisionPanel from "./RoiDecisionPanel";
 
 type RackState = "safe" | "warning" | "critical";
-type View = "overview" | "analysis" | "simulation";
+type View = "overview" | "analysis" | "simulation" | "roi";
+type SpeechState = "idle" | "loading" | "playing" | "error";
+type MicState = "idle" | "recording" | "transcribing" | "error";
+
+const VOICE_API_URL = process.env.NEXT_PUBLIC_VOICE_API_URL || "http://127.0.0.1:8000";
 
 type Rack = {
   id: string;
@@ -72,7 +79,15 @@ export default function DataCenterRoom() {
   const [accepted, setAccepted] = useState(false);
   const [question, setQuestion] = useState("");
   const [aiReply, setAiReply] = useState<string | null>(null);
+  const [speechState, setSpeechState] = useState<SpeechState>("idle");
+  const [micState, setMicState] = useState<MicState>("idle");
   const wheelLocked = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micContextRef = useRef<AudioContext | null>(null);
+  const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const micChunksRef = useRef<Float32Array[]>([]);
+  const micTimerRef = useRef<number | null>(null);
 
   const rack = racks[activeIndex];
   const outcome = rack.id === "R-04" ? 74 : Math.max(65, rack.predicted - 7);
@@ -84,10 +99,17 @@ export default function DataCenterRoom() {
       if (event.key === "1") setView("overview");
       if (event.key === "2") setView("analysis");
       if (event.key === "3") setView("simulation");
+      if (event.key === "4") setView("roi");
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   });
+
+  useEffect(() => () => {
+    audioRef.current?.pause();
+    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (micTimerRef.current) window.clearTimeout(micTimerRef.current);
+  }, []);
 
   function move(direction: number) {
     setActiveIndex((current) => Math.max(0, Math.min(racks.length - 1, current + direction)));
@@ -116,13 +138,110 @@ export default function DataCenterRoom() {
     setView("simulation");
   }
 
-  function speakAnalysis() {
-    if (!("speechSynthesis" in window)) return;
+  async function speakAnalysis() {
+    if (speechState === "loading") return;
+    if (speechState === "playing") {
+      audioRef.current?.pause();
+      if (audioRef.current?.src.startsWith("blob:")) URL.revokeObjectURL(audioRef.current.src);
+      audioRef.current = null;
+      setSpeechState("idle");
+      return;
+    }
     const text = accepted
       ? `Action accepted. ${rack.id} is now converging toward ${outcome} degrees.`
       : `${rack.id} is predicted to reach ${rack.predicted} degrees. ${rack.recommendation}`;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+
+    audioRef.current?.pause();
+    if (audioRef.current?.src.startsWith("blob:")) URL.revokeObjectURL(audioRef.current.src);
+    setSpeechState("loading");
+
+    try {
+      const response = await fetch(`${VOICE_API_URL}/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      if (!response.ok) throw new Error("TTS unavailable");
+
+      const audioUrl = URL.createObjectURL(await response.blob());
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+      audio.onplay = () => setSpeechState("playing");
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        setSpeechState("idle");
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(audioUrl);
+        setSpeechState("error");
+      };
+      await audio.play();
+    } catch {
+      setSpeechState("error");
+      window.setTimeout(() => setSpeechState("idle"), 2400);
+    }
+  }
+
+  async function toggleMicrophone() {
+    if (micState === "recording") {
+      await stopRecording();
+      return;
+    }
+    if (micState === "transcribing") return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const context = new AudioContext();
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      micChunksRef.current = [];
+      processor.onaudioprocess = (event) => {
+        micChunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+      };
+      source.connect(processor);
+      processor.connect(context.destination);
+      micStreamRef.current = stream;
+      micContextRef.current = context;
+      micProcessorRef.current = processor;
+      setMicState("recording");
+      micTimerRef.current = window.setTimeout(() => void stopRecording(), 8000);
+    } catch {
+      setMicState("error");
+      window.setTimeout(() => setMicState("idle"), 2400);
+    }
+  }
+
+  async function stopRecording() {
+    if (micTimerRef.current) window.clearTimeout(micTimerRef.current);
+    micProcessorRef.current?.disconnect();
+    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+    const sampleRate = micContextRef.current?.sampleRate || 48000;
+    await micContextRef.current?.close();
+    micProcessorRef.current = null;
+    micStreamRef.current = null;
+    micContextRef.current = null;
+
+    const audio = mergeAudioChunks(micChunksRef.current);
+    if (audio.length < sampleRate / 4) {
+      setMicState("idle");
+      return;
+    }
+
+    setMicState("transcribing");
+    try {
+      const response = await fetch(`${VOICE_API_URL}/stt`, {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav" },
+        body: encodeWav(audio, sampleRate)
+      });
+      if (!response.ok) throw new Error("STT unavailable");
+      const result = await response.json();
+      setQuestion(typeof result.text === "string" ? result.text : "");
+      setMicState("idle");
+    } catch {
+      setMicState("error");
+      window.setTimeout(() => setMicState("idle"), 2400);
+    }
   }
 
   function askGuardian() {
@@ -139,7 +258,7 @@ export default function DataCenterRoom() {
   }
 
   return (
-    <section className="rg-shell">
+    <section className={`rg-shell ${view === "roi" ? "roi-mode" : ""}`}>
       <AmbientCanvas state={accepted ? "safe" : rack.state} />
 
       <div className="rg-main">
@@ -155,6 +274,7 @@ export default function DataCenterRoom() {
           <LayerButton active={view === "overview"} onClick={() => setView("overview")} icon={Layers3} label="Overview" shortcut="1" />
           <LayerButton active={view === "analysis"} onClick={() => setView("analysis")} icon={Sparkles} label="AI Analysis" shortcut="2" />
           <LayerButton active={view === "simulation"} onClick={() => setView("simulation")} icon={Play} label="Simulation" shortcut="3" />
+          <LayerButton active={view === "roi"} onClick={() => setView("roi")} icon={BadgeEuro} label="ROI Decision" shortcut="4" />
           <div className="layer-context"><span>Selected</span><strong>{rack.id}</strong></div>
         </nav>
 
@@ -172,6 +292,7 @@ export default function DataCenterRoom() {
           {view === "simulation" && (
             <SimulationLayer rack={rack} outcome={outcome} simulated={simulated} accepted={accepted} onRun={() => setSimulated(true)} />
           )}
+          {view === "roi" && <RoiDecisionPanel />}
         </div>
 
         <div className="rg-statusbar" style={palette[accepted ? "safe" : rack.state]}>
@@ -186,7 +307,16 @@ export default function DataCenterRoom() {
         <header className="ai-head">
           <div className={`ai-orb ${accepted ? "orb-safe" : ""}`}><span /></div>
           <div><div className="ai-name"><h2>Guardian AI</h2><span>Live</span></div><p>Decision co-pilot</p></div>
-          <button type="button" aria-label="Speak analysis" onClick={speakAnalysis}><Speaker /></button>
+          <button
+            className={`speech-button speech-${speechState}`}
+            type="button"
+            aria-label={speechState === "loading" ? "Generating speech" : speechState === "playing" ? "Stop speech" : "Speak analysis with Gradium"}
+            title={speechState === "error" ? "Gradium is unavailable. Check the server API key." : "Speak with Gradium"}
+            onClick={speakAnalysis}
+            disabled={speechState === "loading"}
+          >
+            {speechState === "loading" ? <LoaderCircle /> : <Speaker />}
+          </button>
         </header>
 
         <div className="ai-sync"><Cpu /><span>Context synced with {rack.id}</span><b>#{activeIndex + 1}</b></div>
@@ -228,7 +358,16 @@ export default function DataCenterRoom() {
         </div>
         <div className="ai-input">
           <input value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") askGuardian(); }} placeholder={`Ask about ${rack.id}…`} aria-label="Ask Guardian AI" />
-          <button type="button" disabled aria-label="Voice commands coming soon"><Mic /></button>
+          <button
+            className={`mic-button mic-${micState}`}
+            type="button"
+            aria-label={micState === "recording" ? "Stop recording" : micState === "transcribing" ? "Transcribing speech" : "Start voice command"}
+            title={micState === "error" ? "Microphone or Gradium STT unavailable" : "Voice command with Gradium"}
+            onClick={toggleMicrophone}
+            disabled={micState === "transcribing"}
+          >
+            {micState === "transcribing" ? <LoaderCircle /> : <Mic />}
+          </button>
           <button type="button" aria-label="Send message" onClick={askGuardian} disabled={!question.trim()}><Send /></button>
         </div>
         <p className="ai-note">Recommendation only. You remain in control.</p>
@@ -243,7 +382,8 @@ export default function DataCenterRoom() {
           box-shadow: 0 30px 90px rgba(0,0,0,.42);
         }
         .ambient-canvas { position: absolute; inset: 0; z-index: -1; width: 100%; height: 100%; opacity: .68; }
-        .rg-main { display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; min-width: 0; padding: 18px 22px; }
+        .rg-shell.roi-mode{grid-template-columns:minmax(0,1fr)}.roi-mode .rg-ai{display:none}
+        .rg-main { display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; min-width: 0; min-height: 0; overflow: hidden; padding: 18px 22px; }
         .rg-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid rgba(255,255,255,.08); padding-bottom: 13px; }
         .rg-kicker { display: flex; align-items: center; gap: 7px; color: #66ddf3; font-size: 9px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
         .rg-kicker svg { width: 12px; height: 12px; }
@@ -271,9 +411,11 @@ export default function DataCenterRoom() {
         .simulation-layer{grid-template-columns:1fr auto 1fr;align-items:center;gap:18px}.simulation-arrow{color:#55d7ef}.simulation-arrow svg{width:24px}.sim-temp{margin-top:22px;font-size:52px;font-weight:750}.simulation-before .sim-temp{color:#f4779f}.simulation-after .sim-temp{color:#69dca2}.sim-state{display:inline-flex;margin-top:12px;border:1px solid rgba(255,255,255,.09);border-radius:99px;padding:5px 9px;color:#9eacba;font-size:10px}.simulation-after{border-color:rgba(69,197,138,.2);background:rgba(69,197,138,.04)}.run-simulation{display:inline-flex;min-height:42px;align-items:center;gap:7px;margin-top:22px;border:1px solid #20bedb;border-radius:6px;background:#1198b2;padding:0 16px;color:#041419;font-size:11px;font-weight:700}.run-simulation svg{width:14px}
         .rg-statusbar{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:10px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(12,19,28,.76);padding:11px 14px}.rg-stat{display:flex;align-items:center;gap:8px}.rg-stat svg{width:14px;color:#627385}.rg-stat span,.rg-stat strong{display:block}.rg-stat span{color:#68798a;font-size:8px;text-transform:uppercase}.rg-stat strong{margin-top:2px;color:#dce7ee;font-size:12px}.rg-stat.accent strong{color:var(--accent)}
         .rg-ai{display:flex;min-width:0;flex-direction:column;border-left:1px solid rgba(255,255,255,.09);background:rgba(8,13,20,.96);padding:18px}.ai-head{display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(255,255,255,.08);padding-bottom:14px}.ai-orb{position:relative;display:grid;width:42px;height:42px;place-items:center;border:1px solid rgba(72,215,239,.25);border-radius:50%}.ai-orb::before{content:"";position:absolute;inset:7px;border:1px solid rgba(72,215,239,.3);border-radius:50%;animation:orb 3s ease-in-out infinite}.ai-orb span{width:13px;height:13px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#effeff,#45d7ef 40%,#08788f 80%);box-shadow:0 0 17px rgba(72,215,239,.65)}.orb-safe span{background:radial-gradient(circle at 35% 30%,#ecfdf5,#6ee7b7 40%,#047857 80%)}.ai-name{display:flex;align-items:center;gap:6px}.ai-name h2{margin:0;font-size:15px}.ai-name span{border:1px solid rgba(69,197,138,.24);border-radius:99px;padding:2px 5px;color:#72d5a1;font-size:8px;font-weight:700;text-transform:uppercase}.ai-head p{margin:3px 0 0;color:#718095;font-size:9px}.ai-head button{display:grid;width:38px;height:38px;margin-left:auto;place-items:center;border:1px solid rgba(255,255,255,.08);border-radius:6px;background:rgba(255,255,255,.025);color:#8090a0}.ai-head button svg{width:15px}.ai-sync{display:flex;align-items:center;gap:7px;margin-top:12px;border:1px solid rgba(72,215,239,.11);border-radius:6px;background:rgba(72,215,239,.035);padding:8px 9px;color:#8ca1b2;font-size:9px}.ai-sync svg{width:13px;color:#6bd9ed}.ai-sync b{margin-left:auto;color:#617386}
+        .ai-head .speech-playing{border-color:rgba(72,215,239,.35);background:rgba(72,215,239,.08);color:#6de2f5}.ai-head .speech-error{border-color:rgba(240,82,136,.35);color:#f4779f}.speech-loading svg{animation:speech-spin .8s linear infinite}
         .ai-body{flex:1;min-height:0;padding:17px 0 12px}.ai-bubble{display:flex;gap:8px}.bot-mark{display:grid;width:28px;height:28px;place-items:center;border:1px solid rgba(72,215,239,.2);border-radius:6px;color:#70dcef}.bot-mark svg{width:14px}.ai-bubble>div:last-child{flex:1;border:1px solid rgba(255,255,255,.08);border-radius:4px 8px 8px 8px;background:#101923;padding:12px}.ai-bubble span,.ai-cause span,.ai-action-card span{color:#6c7c8d;font-size:8px;font-weight:700;letter-spacing:.09em;text-transform:uppercase}.ai-bubble p{margin:6px 0 0;color:#c6d1da;font-size:13px;line-height:1.58}.ai-cause{margin:12px 0 0 36px;border-left:2px solid rgba(72,215,239,.26);padding:2px 0 2px 11px}.ai-cause span{display:flex;align-items:center;gap:5px}.ai-cause svg{width:12px;color:#68d9ed}.ai-cause strong{display:block;margin-top:7px;color:#dce7ee;font-size:12px}.ai-cause p{margin:3px 0 0;color:#8596a7;font-size:10px}.ai-action-card{margin:15px 0 0 36px;border:1px solid rgba(72,215,239,.16);border-radius:7px;background:rgba(72,215,239,.045);padding:12px}.ai-action-card span{display:flex;align-items:center;gap:6px}.ai-action-card svg{width:13px;color:#6edcef}.ai-action-card strong{display:block;margin-top:8px;color:#e5f7fa;font-size:13px;line-height:1.4}.ai-action-card p{margin:6px 0 0;color:#7f9ca6;font-size:10px}.action-safe{border-color:rgba(69,197,138,.2);background:rgba(69,197,138,.05)}.action-safe strong,.action-safe svg{color:#76d9a5}
         .ai-reply{margin:10px 0 0 36px;border-left:2px solid rgba(72,215,239,.3);padding:4px 10px}.ai-reply span{color:#6bd9ed;font-size:8px;font-weight:700;text-transform:uppercase}.ai-reply p{margin:4px 0 0;color:#afbdc8;font-size:11px;line-height:1.45}.ai-buttons{display:grid;grid-template-columns:.75fr 1.25fr;gap:7px;border-top:1px solid rgba(255,255,255,.08);padding-top:12px}.ai-buttons button{display:inline-flex;min-height:42px;align-items:center;justify-content:center;gap:7px;border-radius:6px;font-size:10px;font-weight:700}.ai-buttons svg{width:14px}.simulate{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.035);color:#c4cfd8}.accept{border:1px solid #22bfdc;background:#1397b1;color:#041318}.ai-buttons button:disabled{cursor:not-allowed;opacity:.42}.ai-input{display:grid;grid-template-columns:minmax(0,1fr) 38px 38px;gap:5px;margin-top:8px}.ai-input input{min-width:0;height:40px;border:1px solid rgba(255,255,255,.09);border-radius:6px;background:#0d151e;padding:0 10px;color:white;font-size:11px}.ai-input button{display:grid;width:38px;height:40px;place-items:center;border:1px solid rgba(255,255,255,.09);border-radius:6px;background:rgba(255,255,255,.03);color:#7790a1}.ai-input svg{width:14px}.ai-input button:disabled{cursor:not-allowed;opacity:.35}.ai-note{margin:7px 0 0;color:#566677;font-size:8px;text-align:center}
-        @keyframes thermal-pulse{50%{box-shadow:0 0 0 1px rgba(240,82,136,.2),0 0 30px rgba(240,82,136,.32),inset 0 0 34px rgba(0,0,0,.36)}}@keyframes orb{50%{transform:scale(1.12);opacity:.45}}
+        .ai-input .mic-recording{border-color:rgba(240,82,136,.45);background:rgba(240,82,136,.1);color:#f4779f;box-shadow:0 0 14px rgba(240,82,136,.16)}.ai-input .mic-error{border-color:rgba(240,82,136,.35);color:#f4779f}.mic-transcribing svg{animation:speech-spin .8s linear infinite}
+        @keyframes thermal-pulse{50%{box-shadow:0 0 0 1px rgba(240,82,136,.2),0 0 30px rgba(240,82,136,.32),inset 0 0 34px rgba(0,0,0,.36)}}@keyframes orb{50%{transform:scale(1.12);opacity:.45}}@keyframes speech-spin{to{transform:rotate(360deg)}}
         @media(max-height:760px) and (min-width:761px){
           .rg-ai{padding:14px 16px}.ai-head{padding-bottom:10px}.ai-orb{width:38px;height:38px}
           .ai-sync{margin-top:9px;padding:7px 9px}.ai-body{padding:11px 0 8px}
@@ -289,6 +431,47 @@ export default function DataCenterRoom() {
       `}</style>
     </section>
   );
+}
+
+function mergeAudioChunks(chunks: Float32Array[]) {
+  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const merged = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+function encodeWav(samples: Float32Array, sampleRate: number) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const write = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+
+  write(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  write(8, "WAVE");
+  write(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  write(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index]));
+    view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return buffer;
 }
 
 function AmbientCanvas({ state }: { state: RackState }) {
