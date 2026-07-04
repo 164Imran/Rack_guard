@@ -19,6 +19,7 @@ type DecisionStatus = "recommended" | "partial" | "not_recommended";
 type RoiDecisionData = {
   gpu_id?: number | string;
   action_label?: string;
+  debug_mode?: string;
   thermal_context?: {
     current_temp_c?: number;
     predicted_temp_no_action_c?: number;
@@ -127,10 +128,15 @@ export default function RoiDecisionPanel({
 
     async function loadDecision() {
       try {
+        const debugExtreme =
+          new URLSearchParams(window.location.search).get("debug") === "extreme";
         const response = await fetch(decisionApiUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ gpu_id: gpuId }),
+          body: JSON.stringify({
+            gpu_id: gpuId,
+            debug_extreme: debugExtreme,
+          }),
           signal: controller.signal,
         });
         if (!response.ok) throw new Error("Decision API unavailable");
@@ -187,6 +193,9 @@ export default function RoiDecisionPanel({
           </span>
           {status === "fallback" && (
             <span className={styles.demoBadge}>Demo data</span>
+          )}
+          {data.debug_mode === "extreme" && (
+            <span className={styles.demoBadge}>Extreme debug</span>
           )}
         </div>
       </header>

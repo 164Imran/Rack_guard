@@ -35,6 +35,24 @@ class RecommendationRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_extreme_debug_is_applied_only_when_requested(self) -> None:
+        normal = self.client.post(
+            "/api/recommendations/final",
+            json={"gpu_id": "rack-1/gpu-1"},
+        ).json()
+        extreme = self.client.post(
+            "/api/recommendations/final",
+            json={"gpu_id": "rack-1/gpu-1", "debug_extreme": True},
+        ).json()
+
+        self.assertLess(normal["thermal_context"]["current_temp_c"], 100_000)
+        self.assertEqual(extreme["thermal_context"]["current_temp_c"], 100_000)
+        self.assertEqual(
+            extreme["thermal_context"]["predicted_temp_no_action_c"],
+            120_000,
+        )
+        self.assertEqual(extreme["debug_mode"], "extreme")
+
 
 if __name__ == "__main__":
     unittest.main()
