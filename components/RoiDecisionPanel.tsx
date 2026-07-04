@@ -17,7 +17,7 @@ import styles from "./RoiDecisionPanel.module.css";
 type DecisionStatus = "recommended" | "partial" | "not_recommended";
 
 type RoiDecisionData = {
-  gpu_id?: number;
+  gpu_id?: number | string;
   action_label?: string;
   thermal_context?: {
     current_temp_c?: number;
@@ -108,21 +108,29 @@ const mockDecision: RoiDecisionData = {
   },
 };
 
-const decisionApiUrl = process.env.NEXT_PUBLIC_DECISION_API_URL;
+const decisionApiUrl =
+  process.env.NEXT_PUBLIC_DECISION_API_URL ||
+  "http://127.0.0.1:8001/api/recommendations/final";
 
-export default function RoiDecisionPanel() {
+export default function RoiDecisionPanel({
+  gpuId = "rack-1/gpu-1",
+}: {
+  gpuId?: string;
+}) {
   const [data, setData] = useState<RoiDecisionData>(mockDecision);
   const [status, setStatus] = useState<"loading" | "ready" | "fallback">(
-    decisionApiUrl ? "loading" : "fallback",
+    "loading",
   );
 
   useEffect(() => {
-    if (!decisionApiUrl) return;
     const controller = new AbortController();
 
     async function loadDecision() {
       try {
-        const response = await fetch(decisionApiUrl as string, {
+        const response = await fetch(decisionApiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gpu_id: gpuId }),
           signal: controller.signal,
         });
         if (!response.ok) throw new Error("Decision API unavailable");
@@ -138,7 +146,7 @@ export default function RoiDecisionPanel() {
 
     void loadDecision();
     return () => controller.abort();
-  }, []);
+  }, [gpuId]);
 
   if (status === "loading") {
     return (
