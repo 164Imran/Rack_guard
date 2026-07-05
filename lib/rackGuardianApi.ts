@@ -1,5 +1,6 @@
 import { rackFleet } from "./mockRackFleet";
 import type {
+  ActionScore,
   ActionSimulation,
   ActionType,
   BackendHealth,
@@ -8,6 +9,9 @@ import type {
   FinalRecommendation,
   GpuDecisionData,
   GpuSnapshot,
+  MinhDiagnosis,
+  MinhMigrationPlan,
+  MinhReport,
   RoiResult,
   TemperaturePrediction,
 } from "./rackGuardianTypes";
@@ -158,8 +162,8 @@ function mockRecommendation(gpu: GpuSnapshot): FinalRecommendation {
         gpu.simulated_solution.risk_after === "normal" ? 0.12 : 0.45,
     },
     simulation: mockSimulation(gpu, actionType),
-    ranked_actions: [],
-    action_scores: [],
+    ranked_actions: mockActionScores(gpu),
+    action_scores: mockActionScores(gpu),
     report: {
       incident_summary: gpu.risk_reason,
       likely_cause: gpu.risk_reason,
@@ -172,6 +176,39 @@ function mockRecommendation(gpu: GpuSnapshot): FinalRecommendation {
       provider: "mock_fallback",
     },
   };
+}
+
+function mockActionScores(gpu: GpuSnapshot): ActionScore[] {
+  const coolingGain = gpu.simulated_solution.cooling_gain_c;
+  return [
+    {
+      action_id: "increase_cooling_request",
+      label: "Increase ventilation",
+      score: gpu.status === "critical" ? 92 : 78,
+      cooling_gain_c: coolingGain,
+      risk_reduction: gpu.status === "critical" ? 0.64 : 0.3,
+      operational_cost: "Low energy increase",
+      performance_impact: "none",
+    },
+    {
+      action_id: "apply_power_frequency_cap",
+      label: "Reduce GPU power cap",
+      score: gpu.status === "critical" ? 84 : 72,
+      cooling_gain_c: Math.max(4, coolingGain - 2),
+      risk_reduction: gpu.status === "critical" ? 0.52 : 0.24,
+      operational_cost: "Moderate performance impact",
+      performance_impact: "medium",
+    },
+    {
+      action_id: "migrate_inference_traffic",
+      label: "Migrate workload",
+      score: gpu.status === "critical" ? 76 : 65,
+      cooling_gain_c: Math.max(7, coolingGain),
+      risk_reduction: gpu.status === "critical" ? 0.58 : 0.28,
+      operational_cost: "Migration coordination required",
+      performance_impact: "low",
+    },
+  ].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 }
 
 export async function getBackendHealth(
@@ -269,6 +306,73 @@ export async function getFinalRecommendation(
   }
 }
 
+export async function getMinhDiagnosis(
+  gpu: GpuSnapshot,
+  signal?: AbortSignal,
+): Promise<MinhDiagnosis> {
+  const result = await getFinalRecommendation(gpu, signal);
+  return result.diagnosis ?? mockRecommendation(gpu).diagnosis!;
+}
+
+export async function getMinhRecommendation(
+  gpu: GpuSnapshot,
+  signal?: AbortSignal,
+): Promise<FinalRecommendation> {
+  return getFinalRecommendation(gpu, signal);
+}
+
+export async function getMinhForecast(
+  gpu: GpuSnapshot,
+  signal?: AbortSignal,
+): Promise<TemperaturePrediction> {
+  return getTemperaturePrediction(gpu, signal);
+}
+
+export async function getMinhActionScores(
+  gpu: GpuSnapshot,
+  signal?: AbortSignal,
+): Promise<ActionScore[]> {
+  const result = await getFinalRecommendation(gpu, signal);
+  return result.action_scores ?? result.ranked_actions ?? [];
+}
+
+export async function getMinhReport(
+  gpu: GpuSnapshot,
+  signal?: AbortSignal,
+): Promise<MinhReport> {
+  const result = await getFinalRecommendation(gpu, signal);
+  return result.report ?? mockRecommendation(gpu).report!;
+}
+
+export async function getMinhMigrationPlan(
+  gpu: GpuSnapshot,
+  signal?: AbortSignal,
+): Promise<MinhMigrationPlan> {
+  const result = await getFinalRecommendation(gpu, signal);
+  return result.migration_plan ?? buildFallbackMigrationPlan(gpu, result);
+}
+
+function buildFallbackMigrationPlan(
+  gpu: GpuSnapshot,
+  result: FinalRecommendation,
+): MinhMigrationPlan {
+  return {
+    simulated: true,
+    target_action: result.action_label || gpu.recommended_action,
+    reason:
+      result.diagnosis?.likely_cause ??
+      "Thermal risk requires an operator-reviewed mitigation plan.",
+    steps: [
+      "Confirm destination GPU capacity.",
+      "Pause or checkpoint the workload.",
+      "Simulate the workload transfer.",
+      "Verify the predicted thermal state.",
+    ],
+    estimated_risk_reduction: result.roi_result?.risk_reduction ?? null,
+    operator_confirmation_required: true,
+  };
+}
+
 export async function getRoi(
   gpu: GpuSnapshot,
   recommendation: FinalRecommendation,
@@ -327,6 +431,10 @@ export async function loadGpuDecision(
       ) ?? mockCurrent(gpu);
   current.status = normalizedStatus(current.status);
   const roi = await getRoi(gpu, recommendation, signal);
+  recommendation.migration_plan ??= buildFallbackMigrationPlan(
+    gpu,
+    recommendation,
+  );
   const hasBackendData =
     health.status === "ok" &&
     currentResponse.source !== "mock_fallback" &&

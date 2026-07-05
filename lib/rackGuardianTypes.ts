@@ -127,18 +127,41 @@ export type ActionScore = {
   net_gain_eur?: number;
   roi_percent?: number | null;
   decision?: string;
+  cooling_gain_c?: number | null;
+  risk_reduction?: number | null;
+  action_cost_eur?: number | null;
+  performance_impact?: string;
+};
+
+export type MinhDiagnosis = {
+  likely_cause?: string;
+  confidence?: number | null;
+  reasons?: string[];
+  evidence_summary?: string;
+};
+
+export type MinhReport = {
+  incident_summary?: string;
+  likely_cause?: string;
+  evidence_used?: string[];
+  operator_next_step?: string;
+  escalation_note?: string;
+};
+
+export type MinhMigrationPlan = {
+  simulated: true;
+  target_action: string;
+  reason: string;
+  steps: string[];
+  estimated_risk_reduction?: number | null;
+  operator_confirmation_required: true;
 };
 
 export type FinalRecommendation = {
   gpu_id: string;
   rack_id: string;
   action_label: string;
-  diagnosis?: {
-    likely_cause?: string;
-    confidence?: number | null;
-    reasons?: string[];
-    evidence_summary?: string;
-  };
+  diagnosis?: MinhDiagnosis;
   why?: string[];
   thermal_context?: {
     current_temp_c?: number | null;
@@ -152,14 +175,8 @@ export type FinalRecommendation = {
   roi_result?: RoiResult;
   ranked_actions?: ActionScore[];
   action_scores?: ActionScore[];
-  report?: {
-    incident_summary?: string;
-    likely_cause?: string;
-    evidence_used?: string[];
-    operator_next_step?: string;
-    escalation_note?: string;
-  };
-  migration_plan?: Record<string, unknown> | null;
+  report?: MinhReport;
+  migration_plan?: MinhMigrationPlan | null;
   llm_report?: { summary?: string; provider?: string };
   assumptions?: {
     financial_inputs?: Partial<Record<ActionType, Record<string, number>>>;
