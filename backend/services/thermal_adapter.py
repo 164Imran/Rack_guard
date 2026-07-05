@@ -81,7 +81,7 @@ def get_temperature_prediction(
     if trajectory and sampled_trajectory[-1] != trajectory[-1]:
         sampled_trajectory.append(trajectory[-1])
 
-    return {
+    baseline = {
         "gpu_id": telemetry.get("gpu_id"),
         "rack_id": telemetry.get("rack_id"),
         "source": evaluation.get("prediction_source", "minh_simulator"),
@@ -91,12 +91,25 @@ def get_temperature_prediction(
         ),
         "predicted_peak_temp_c": forecast.get("peak_temp_c"),
         "predicted_equilibrium_temp_c": forecast.get("convergence_temp_c"),
-        "safe_limit_c": forecast.get("threshold_c"),
+        "safe_limit_c": forecast.get("threshold_c") or 85.0,
         "time_to_threshold_s": forecast.get("time_to_threshold_s"),
         "risk": _normalize_risk(forecast.get("risk")),
         "confidence": forecast.get("confidence"),
         "trajectory": sampled_trajectory,
     }
+    from .imran_prediction_adapter import predict_temperature_with_imran
+
+    return predict_temperature_with_imran(
+        {
+            "gpu_id": telemetry.get("gpu_id"),
+            "rack_id": telemetry.get("rack_id"),
+            "power_draw_w": telemetry.get("gpu_power_w"),
+            "current_temp_c": baseline["current_temp_c"],
+            "predicted_temp_c": baseline["predicted_equilibrium_temp_c"],
+            "utilization_percent": telemetry.get("gpu_util_pct"),
+        },
+        baseline,
+    )
 
 
 def simulate_action(

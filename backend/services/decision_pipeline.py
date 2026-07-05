@@ -154,12 +154,16 @@ def build_final_recommendation(
         "llm_report": {
             "summary": llm_summary,
             "provider": "deterministic_fallback",
-            "imran_module": "pending",
+            "imran_module": "used"
+            if prediction.get("source") == "imran_node"
+            else "fallback",
         },
         "module_status": {
             "minh_thermal": "used",
             "roi_and_audit": "used",
-            "imran": "pending",
+            "imran": "used"
+            if prediction.get("source") == "imran_node"
+            else "fallback",
         },
         "assumptions": {
             "source": "request"

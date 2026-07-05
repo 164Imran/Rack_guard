@@ -19,6 +19,7 @@ class PredictionRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["gpu_id"], "gpu-1")
         self.assertIn(payload["risk"], {"safe", "warning", "critical"})
+        self.assertIn(payload["source"], {"imran_node", "minh", "fallback"})
         self.assertGreater(payload["predicted_peak_temp_c"], 0)
         self.assertLessEqual(len(payload["trajectory"]), 22)
 

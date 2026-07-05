@@ -1,2 +1,5 @@
 -r requirements-voice.txt
-numpy==2.2.6
+numpy>=2.2.6,<3
+
+# Optional Imran NODE predictor:
+# python -m pip install -r requirements-imran.txt

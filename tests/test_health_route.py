@@ -13,6 +13,10 @@ class HealthRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["modules"]["roi_and_audit"], "ready")
+        self.assertIn(
+            payload["modules"]["imran"],
+            {"disabled", "fallback", "configured"},
+        )
         self.assertTrue(payload["mock_fallback"])
 
 

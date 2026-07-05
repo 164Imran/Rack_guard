@@ -28,7 +28,7 @@ class RecommendationRouteTests(unittest.TestCase):
         self.assertIsNone(payload["migration_plan"])
         self.assertEqual(payload["module_status"]["minh_thermal"], "used")
         self.assertEqual(payload["module_status"]["roi_and_audit"], "used")
-        self.assertEqual(payload["module_status"]["imran"], "pending")
+        self.assertIn(payload["module_status"]["imran"], {"used", "fallback"})
         self.assertEqual(payload["assumptions"]["source"], "demo_defaults")
         self.assertEqual(len(payload["ranked_actions"]), 4)
 

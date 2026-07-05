@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from ...services.thermal_adapter import thermal_source_status
+from ...services.imran_prediction_adapter import imran_runtime_status
 
 router = APIRouter(tags=["system"])
 
@@ -17,7 +18,7 @@ async def health() -> dict[str, object]:
         "modules": {
             "minh_thermal": thermal_source_status(),
             "roi_and_audit": "ready",
-            "imran": "pending",
+            "imran": imran_runtime_status(),
         },
         "mock_fallback": True,
     }
