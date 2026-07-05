@@ -101,6 +101,7 @@ export default function DataCenterRoom() {
   const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const micChunksRef = useRef<Float32Array[]>([]);
   const micTimerRef = useRef<number | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const rack = racks[activeIndex];
   const outcome = rack.id === "R-04" ? 74 : Math.max(65, rack.predicted - 7);
@@ -120,6 +121,13 @@ export default function DataCenterRoom() {
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (micTimerRef.current) window.clearTimeout(micTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest"
+    });
+  }, [chatMessages, copilotLoading]);
 
   function move(direction: number) {
     setActiveIndex((current) => Math.max(0, Math.min(racks.length - 1, current + direction)));
@@ -410,6 +418,7 @@ export default function DataCenterRoom() {
                 </div>
               ))}
               {copilotLoading && <div className="ai-thinking"><LoaderCircle />Thinking…</div>}
+              <div ref={messagesEndRef} aria-hidden="true" />
             </div>
           )}
         </div>
@@ -483,6 +492,20 @@ export default function DataCenterRoom() {
         .ai-body{flex:1;min-height:0;overflow-y:auto;padding:17px 2px 12px 0;scrollbar-width:thin;scrollbar-color:rgba(72,215,239,.22) transparent}.ai-bubble{display:flex;gap:8px}.bot-mark{display:grid;width:28px;height:28px;place-items:center;border:1px solid rgba(72,215,239,.2);border-radius:6px;color:#70dcef}.bot-mark svg{width:14px}.ai-bubble>div:last-child{flex:1;border:1px solid rgba(255,255,255,.08);border-radius:4px 8px 8px 8px;background:#101923;padding:12px}.ai-bubble span,.ai-cause span,.ai-action-card span{color:#6c7c8d;font-size:8px;font-weight:700;letter-spacing:.09em;text-transform:uppercase}.ai-bubble p{margin:6px 0 0;color:#c6d1da;font-size:13px;line-height:1.58}.ai-cause{margin:12px 0 0 36px;border-left:2px solid rgba(72,215,239,.26);padding:2px 0 2px 11px}.ai-cause span{display:flex;align-items:center;gap:5px}.ai-cause svg{width:12px;color:#68d9ed}.ai-cause strong{display:block;margin-top:7px;color:#dce7ee;font-size:12px}.ai-cause p{margin:3px 0 0;color:#8596a7;font-size:10px}.ai-action-card{margin:15px 0 0 36px;border:1px solid rgba(72,215,239,.16);border-radius:7px;background:rgba(72,215,239,.045);padding:12px}.ai-action-card span{display:flex;align-items:center;gap:6px}.ai-action-card svg{width:13px;color:#6edcef}.ai-action-card strong{display:block;margin-top:8px;color:#e5f7fa;font-size:13px;line-height:1.4}.ai-action-card p{margin:6px 0 0;color:#7f9ca6;font-size:10px}.action-safe{border-color:rgba(69,197,138,.2);background:rgba(69,197,138,.05)}.action-safe strong,.action-safe svg{color:#76d9a5}
         .ai-conversation{display:grid;gap:7px;margin:12px 0 0 36px}.ai-message{border:1px solid rgba(255,255,255,.075);border-radius:6px;background:rgba(255,255,255,.025);padding:8px 9px}.ai-message>span{display:flex;align-items:center;justify-content:space-between;color:#758698;font-size:8px;font-weight:750;text-transform:uppercase}.ai-message span b{border:1px solid rgba(72,215,239,.2);border-radius:99px;padding:2px 5px;color:#64d5e9;font-size:7px}.ai-message p{margin:4px 0 0;color:#afbdc8;font-size:10px;line-height:1.45}.message-user{margin-left:18px;border-color:rgba(72,215,239,.14);background:rgba(72,215,239,.04)}.ai-thinking{display:flex;align-items:center;gap:6px;color:#7c8e9f;font-size:9px}.ai-thinking svg,.ai-input .send-loading svg{width:13px;animation:speech-spin .8s linear infinite}.ai-buttons{display:grid;border-top:1px solid rgba(255,255,255,.08);padding-top:12px}.ai-buttons button{display:inline-flex;min-height:42px;align-items:center;justify-content:center;gap:7px;border-radius:6px;font-size:10px;font-weight:700}.ai-buttons svg{width:14px}.accept{border:1px solid #22bfdc;background:#1397b1;color:#041318}.ai-buttons button:disabled{cursor:not-allowed;opacity:.42}.ai-input{display:grid;grid-template-columns:minmax(0,1fr) 38px 38px;gap:5px;margin-top:8px}.ai-input input{min-width:0;height:40px;border:1px solid rgba(255,255,255,.09);border-radius:6px;background:#0d151e;padding:0 10px;color:white;font-size:11px}.ai-input button{display:grid;width:38px;height:40px;place-items:center;border:1px solid rgba(255,255,255,.09);border-radius:6px;background:rgba(255,255,255,.03);color:#7790a1}.ai-input svg{width:14px}.ai-input button:disabled{cursor:not-allowed;opacity:.35}.ai-note{margin:7px 0 0;color:#566677;font-size:8px;text-align:center}
         .ai-input .mic-recording{border-color:rgba(240,82,136,.45);background:rgba(240,82,136,.1);color:#f4779f;box-shadow:0 0 14px rgba(240,82,136,.16)}.ai-input .mic-error{border-color:rgba(240,82,136,.35);color:#f4779f}.mic-transcribing svg{animation:speech-spin .8s linear infinite}
+
+        /* Keep the Copilot frame stable while only its conversation scrolls. */
+        .rg-ai{
+          box-sizing:border-box;height:calc(100dvh - 24px);max-height:calc(100dvh - 24px);
+          min-height:0;overflow:hidden
+        }
+        .ai-head,.ai-sync,.ai-buttons,.ai-input,.ai-note{flex-shrink:0}
+        .ai-body{display:flex;min-height:0;overflow:hidden;flex-direction:column}
+        .ai-bubble,.ai-cause,.ai-action-card{flex-shrink:0}
+        .ai-conversation{
+          display:grid;flex:1;min-height:0;align-content:start;overflow-y:auto;
+          padding-right:4px;overscroll-behavior:contain;scrollbar-width:thin;
+          scrollbar-color:rgba(72,215,239,.22) transparent;
+        }
 
         /* Minimalist visual pass: semantic color stays, decorative effects recede. */
         .rg-shell{border-color:rgba(255,255,255,.07);border-radius:8px;background:#090d12;box-shadow:0 12px 36px rgba(0,0,0,.24)}
