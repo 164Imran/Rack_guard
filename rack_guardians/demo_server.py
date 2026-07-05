@@ -31,6 +31,7 @@ from agent import (  # noqa: E402
     DEFAULT_THRESHOLD_C,
     ForecastSummary,
     RackTelemetry,
+    bloc_a_input_schema,
     build_demo_case,
     build_gpu_fleet,
     build_inference_fleet,
@@ -38,6 +39,7 @@ from agent import (  # noqa: E402
     classify_risk,
     evaluate_rack,
     execute_migration_plan,
+    forecast_with_bloc_a,
     prediction_table,
     propose_migration_plan,
     simulate_mitigation,
@@ -1553,7 +1555,9 @@ INDEX_HTML = r"""<!doctype html>
 
     function predictionSourceLabel(value) {
       const labels = {
+        bloc_a_neural_ode: "Bloc A Neural ODE",
         node_checkpoint: "Neural ODE",
+        real_input_derived_forecast: "Real input derived forecast",
         simulator_forecast_placeholder: "Simulator placeholder",
         workload_driven_thermal_simulation: "Workload-driven simulation",
         post_migration_simulation: "Post-migration simulation",
@@ -1786,7 +1790,10 @@ def _parse_dataset_text(text: str) -> list[dict[str, Any]]:
         if isinstance(parsed, dict) and "racks" in parsed:
             return parsed["racks"]
         if isinstance(parsed, dict) and "telemetry" in parsed:
-            return [parsed["telemetry"]]
+            row = dict(parsed["telemetry"] or {})
+            if "observed_window" in parsed:
+                row["observed_window"] = parsed["observed_window"]
+            return [row]
         if isinstance(parsed, dict):
             return [parsed]
         if isinstance(parsed, list):
@@ -1805,10 +1812,18 @@ def _evaluate_real_rows(rows: list[dict[str, Any]], use_crusoe: bool = False) ->
 
     fleet: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
+        observed_window = row.get("observed_window") if isinstance(row, dict) else None
         telemetry_data = _normalize_telemetry_row(row, index)
         telemetry = RackTelemetry.from_dict(telemetry_data)
-        forecast = _forecast_from_real_telemetry(telemetry)
+        forecast = forecast_with_bloc_a(
+            telemetry,
+            observed_window=observed_window,
+            context={"source": "real_input"},
+        ) or _forecast_from_real_telemetry(telemetry)
         result = evaluate_rack(telemetry, forecast, use_crusoe=use_crusoe)
+        result["prediction_source"] = getattr(forecast, "prediction_source", "real_input_derived_forecast")
+        if hasattr(forecast, "bloc_a"):
+            result["bloc_a"] = getattr(forecast, "bloc_a")
         result["observed_table"] = telemetry_table(result["telemetry"])
         result["prediction_table"] = prediction_table(ForecastSummary(**result["forecast"]))
         fleet.append(result)
@@ -1891,6 +1906,7 @@ class RackGuardianHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "crusoe_key_present": bool(os.getenv("CRUSOE_API_KEY")),
                 "simulator": "rack_guardians.simulator",
+                "bloc_a": bloc_a_input_schema(),
             })
             return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
@@ -1972,7 +1988,10 @@ class RackGuardianHandler(BaseHTTPRequestHandler):
         elif body.get("racks"):
             rows = body["racks"]
         elif body.get("telemetry"):
-            rows = [body["telemetry"]]
+            row = dict(body["telemetry"])
+            if body.get("observed_window"):
+                row["observed_window"] = body["observed_window"]
+            rows = [row]
         else:
             raise ValueError("real input requires telemetry, racks, or dataset_text")
         return _evaluate_real_rows(rows, use_crusoe=use_crusoe)

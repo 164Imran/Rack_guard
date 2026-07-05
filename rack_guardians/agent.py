@@ -27,6 +27,14 @@ try:
 except ImportError:  # pragma: no cover - useful when run from rack_guardians/
     import simulator
 
+try:
+    from . import bloc_a_predictor
+except ImportError:  # pragma: no cover - useful when run from rack_guardians/
+    try:
+        import bloc_a_predictor
+    except ImportError:  # pragma: no cover - NODE is optional at runtime
+        bloc_a_predictor = None
+
 
 CRUSOE_BASE_URL = "https://api.inference.crusoecloud.com/v1/"
 CRUSOE_MODEL = "nvidia/Nemotron-3-Nano-Omni-Reasoning-30B-A3B"
@@ -210,6 +218,144 @@ def forecast_from_trajectory(
         risk=risk,
         confidence=confidence,
         trajectory=points,
+    )
+
+
+def forecast_with_bloc_a(
+    telemetry: RackTelemetry,
+    observed_window: Any = None,
+    context: Optional[dict[str, Any]] = None,
+) -> Optional[ForecastSummary]:
+    """Use Bloc A's Neural ODE checkpoint when its three-channel input is available.
+
+    Bloc A currently consumes only ``power_w``, ``gpu_temp_c`` and
+    ``heatsink_temp_c``. Bloc B still keeps richer telemetry for diagnosis.
+    """
+
+    if bloc_a_predictor is None:
+        return None
+    prediction = bloc_a_predictor.predict_gpu_temperature(
+        observed_window=observed_window,
+        telemetry=telemetry,
+        context=context or {},
+    )
+    if not prediction.get("ok"):
+        return None
+    points = prediction.get("trajectory") or []
+    if not points:
+        return None
+    forecast = _forecast_from_points(
+        points,
+        threshold_c=DEFAULT_THRESHOLD_C,
+        confidence=float(prediction.get("confidence", 0.78)),
+    )
+    forecast.prediction_source = prediction.get("source", "bloc_a_neural_ode")
+    forecast.bloc_a = {
+        "source": prediction.get("source", "bloc_a_neural_ode"),
+        "input_mode": prediction.get("input_mode"),
+        "model_meta": prediction.get("model_meta", {}),
+        "input_schema": prediction.get("input_schema", {}),
+        "power_scaled_for_node": prediction.get("power_scaled_for_node", False),
+        "context_adjustment_c": prediction.get("context_adjustment_c", 0.0),
+        "observed_window": prediction.get("observed_window", []),
+    }
+    return forecast
+
+
+def bloc_a_input_schema() -> dict[str, Any]:
+    if bloc_a_predictor is None:
+        return {
+            "available": False,
+            "reason": "bloc_a_predictor module is not importable",
+            "required_channels": ["power_w", "gpu_temp_c", "heatsink_temp_c"],
+        }
+    schema = bloc_a_predictor.input_schema()
+    schema["available"] = bloc_a_predictor.model_available()
+    schema["note"] = (
+        "Bloc A predicts temperature from three thermal channels. "
+        "Bloc B keeps richer telemetry for diagnosis and recommendations."
+    )
+    return schema
+
+
+def forecasts_many_with_bloc_a(items: list[dict[str, Any]]) -> list[Optional[ForecastSummary]]:
+    if bloc_a_predictor is None:
+        return [None for _ in items]
+    predictions = bloc_a_predictor.predict_gpu_temperature_batch(items)
+    forecasts: list[Optional[ForecastSummary]] = []
+    for prediction in predictions:
+        if not prediction.get("ok"):
+            forecasts.append(None)
+            continue
+        forecast = _forecast_from_points(
+            prediction.get("trajectory") or [],
+            threshold_c=DEFAULT_THRESHOLD_C,
+            confidence=float(prediction.get("confidence", 0.78)),
+        )
+        forecast.prediction_source = prediction.get("source", "bloc_a_neural_ode")
+        forecast.bloc_a = {
+            "source": prediction.get("source", "bloc_a_neural_ode"),
+            "input_mode": prediction.get("input_mode"),
+            "model_meta": prediction.get("model_meta", {}),
+            "input_schema": prediction.get("input_schema", {}),
+            "power_scaled_for_node": prediction.get("power_scaled_for_node", False),
+            "context_adjustment_c": prediction.get("context_adjustment_c", 0.0),
+            "observed_window": prediction.get("observed_window", []),
+        }
+        forecasts.append(forecast)
+    return forecasts
+
+
+def _forecast_from_points(
+    points: list[dict[str, Any]],
+    threshold_c: float = DEFAULT_THRESHOLD_C,
+    confidence: float = 0.82,
+    max_points: int = 180,
+) -> ForecastSummary:
+    temps = [float(point["gpu_temp_c"]) for point in points]
+    current = temps[0]
+    peak = max(temps)
+    horizon_s = float(points[-1].get("t_s", 0.0)) if points else 0.0
+    tail_start = max(0.0, horizon_s - 60.0)
+    tail = [float(point["gpu_temp_c"]) for point in points if float(point.get("t_s", 0.0)) >= tail_start]
+    if not tail:
+        tail = temps[-min(len(temps), 12):]
+
+    crossing = None
+    for point in points:
+        if float(point["gpu_temp_c"]) >= threshold_c:
+            crossing = float(point.get("t_s", 0.0))
+            break
+
+    step = max(1, int(math.ceil(len(points) / max_points)))
+    sampled = []
+    for point in points[::step]:
+        sampled.append({
+            "t_s": round(float(point.get("t_s", 0.0)), 3),
+            "power_w": round(float(point.get("power_w", 0.0)), 3),
+            "gpu_temp_c": round(float(point.get("gpu_temp_c", 0.0)), 3),
+            "heatsink_temp_c": round(float(point.get("heatsink_temp_c", 0.0)), 3),
+        })
+    if sampled and sampled[-1]["t_s"] != round(float(points[-1].get("t_s", 0.0)), 3):
+        point = points[-1]
+        sampled.append({
+            "t_s": round(float(point.get("t_s", 0.0)), 3),
+            "power_w": round(float(point.get("power_w", 0.0)), 3),
+            "gpu_temp_c": round(float(point.get("gpu_temp_c", 0.0)), 3),
+            "heatsink_temp_c": round(float(point.get("heatsink_temp_c", 0.0)), 3),
+        })
+
+    convergence = sum(tail) / len(tail)
+    return ForecastSummary(
+        threshold_c=threshold_c,
+        horizon_s=horizon_s,
+        current_temp_c=current,
+        peak_temp_c=peak,
+        convergence_temp_c=convergence,
+        time_to_threshold_s=crossing,
+        risk=classify_risk(current, peak, convergence, crossing, threshold_c),
+        confidence=round(_clip(confidence, 0.0, 0.99), 3),
+        trajectory=sampled,
     )
 
 
@@ -1295,10 +1441,10 @@ def build_inference_fleet(
     rng = random.Random(seed)
     workload = _simulate_inference_workload(rack_count, gpus_per_rack, rng)
     schedule = _schedule_inference_workload(workload, rack_count, gpus_per_rack, rng)
+    cases: list[dict[str, Any]] = []
     racks = []
 
     for rack_idx in range(1, rack_count + 1):
-        gpus = []
         for gpu_idx in range(1, gpus_per_rack + 1):
             state = schedule[(rack_idx, gpu_idx)]
             telemetry, forecast, case_type = _build_workload_driven_case(
@@ -1308,14 +1454,47 @@ def build_inference_fleet(
                 state=state,
                 rng=rng,
             )
-            result = evaluate_rack(telemetry, forecast, use_crusoe=False)
-            result["simulated_case"] = case_type
-            result["prediction_source"] = "workload_driven_thermal_simulation"
-            result["workload_request"] = workload
-            result["scheduler_state"] = state
-            result["observed_table"] = telemetry_table(asdict(telemetry))
-            result["prediction_table"] = prediction_table(forecast)
-            gpus.append(result)
+            cases.append({
+                "rack_idx": rack_idx,
+                "gpu_idx": gpu_idx,
+                "state": state,
+                "telemetry": telemetry,
+                "fallback_forecast": forecast,
+                "case_type": case_type,
+                "context": {
+                    "workload": workload,
+                    "scheduler_state": state,
+                    "extra_racks_needed": workload.get("extra_racks_needed", 0),
+                },
+            })
+
+    bloc_a_forecasts = forecasts_many_with_bloc_a([
+        {
+            "telemetry": case["telemetry"],
+            "context": case["context"],
+        }
+        for case in cases
+    ])
+
+    cases_by_rack: dict[int, list[dict[str, Any]]] = {}
+    for case, bloc_a_forecast in zip(cases, bloc_a_forecasts):
+        telemetry = case["telemetry"]
+        forecast = bloc_a_forecast or case["fallback_forecast"]
+        result = evaluate_rack(telemetry, forecast, use_crusoe=False)
+        result["simulated_case"] = case["case_type"]
+        result["prediction_source"] = getattr(forecast, "prediction_source", "workload_driven_thermal_simulation")
+        if hasattr(forecast, "bloc_a"):
+            result["bloc_a"] = getattr(forecast, "bloc_a")
+        result["workload_request"] = workload
+        result["scheduler_state"] = case["state"]
+        result["observed_table"] = telemetry_table(asdict(telemetry))
+        result["prediction_table"] = prediction_table(forecast)
+        cases_by_rack.setdefault(case["rack_idx"], []).append(result)
+
+    for rack_idx in range(1, rack_count + 1):
+        gpus = cases_by_rack.get(rack_idx, [])
+        if not gpus:
+            continue
         rack = _aggregate_gpu_rack(f"rack-{rack_idx}", gpus)
         rack["scheduler_policy"] = workload["scheduler_policy"]
         racks.append(rack)
