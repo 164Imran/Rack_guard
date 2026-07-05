@@ -53,7 +53,7 @@ def get_current_gpu_state(
 def get_gpu_evaluation(gpu_id: str, seed: int = 42) -> dict[str, Any] | None:
     """Return Minh's complete evaluation for one GPU."""
 
-    racks, _ = _load_fleet(3, 8, seed)
+    racks, _ = _load_fleet(4, 8, seed)
     for rack in racks:
         for gpu in rack.get("gpus", []):
             telemetry = gpu.get("telemetry", {})

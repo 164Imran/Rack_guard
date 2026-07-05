@@ -103,6 +103,8 @@ def build_final_recommendation(
     best_simulation = simulations[best_action]
     telemetry = evaluation.get("telemetry", {})
     forecast = evaluation.get("forecast", {})
+    diagnosis = evaluation.get("diagnosis", {})
+    minh_recommendation = evaluation.get("recommendation", {})
 
     thermal_context = {
         "current_temp_c": telemetry.get("gpu_temp_c"),
@@ -131,6 +133,8 @@ def build_final_recommendation(
         "gpu_id": telemetry.get("gpu_id"),
         "rack_id": telemetry.get("rack_id"),
         "action_label": ACTION_LABELS[best_action],
+        "diagnosis": diagnosis,
+        "why": diagnosis.get("reasons", []),
         "thermal_context": thermal_context,
         "simulation": best_simulation,
         "roi_result": {
@@ -143,6 +147,9 @@ def build_final_recommendation(
             ],
         },
         "ranked_actions": ranked,
+        "action_scores": minh_recommendation.get("candidates", []),
+        "report": evaluation.get("report", {}),
+        "migration_plan": None,
         "hidden_cost_audit": audit,
         "llm_report": {
             "summary": llm_summary,
