@@ -65,7 +65,14 @@ class CouplingMLP(nn.Module):
 
 
 class ThermalNODE(nn.Module):
-    def __init__(self, l_obs, norm_scale=(100.0, 100.0, 100.0), horizon_s=150.0):
+    def __init__(self, l_obs, norm_scale=(250.0, 100.0, 100.0), horizon_s=150.0,
+                 t_amb_init=20.0, p_eq_init=60.0):
+        """norm_scale et p_eq_init doivent correspondre à l'échelle réelle de calibration.json
+        (ex. p_load_max~242W -> norm_scale[0]~250, pas l'ancienne échelle nominale ~100W).
+        Sans ça, l'encodeur/coupling_mlp reçoivent des états normalisés > 2 (au lieu de ~1),
+        ce qui pousse les tanh vers la saturation et ralentit fortement la convergence
+        (observé sur le run précédent : plateau de loss ~90 epochs avant de percer).
+        """
         super().__init__()
         self.encoder = NodeEncoder(l_obs)
         self.coupling_mlp = CouplingMLP()
@@ -73,16 +80,18 @@ class ThermalNODE(nn.Module):
         self.register_buffer("norm_scale", torch.tensor(norm_scale))
 
         # équation RC connue, R/C entraînables en log-espace (positivité garantie)
-        nominal = {"T_amb": 20.0, "R1": 0.06, "R2": 0.14, "C_die": 45.0, "C_hs": 220.0}
-        self.T_amb = nominal["T_amb"]  # ambiant fixe, non appris
+        nominal = {"R1": 0.06, "R2": 0.14, "C_die": 45.0, "C_hs": 220.0}
+        self.T_amb = t_amb_init  # ambiant fixe, non appris
         self.log_R1 = nn.Parameter(torch.log(torch.tensor(nominal["R1"])))
         self.log_R2 = nn.Parameter(torch.log(torch.tensor(nominal["R2"])))
         self.log_Cdie = nn.Parameter(torch.log(torch.tensor(nominal["C_die"])))
         self.log_Chs = nn.Parameter(torch.log(torch.tensor(nominal["C_hs"])))
 
-        # dynamique de puissance : relaxation vers un équilibre appris
+        # dynamique de puissance : relaxation vers un équilibre appris, initialisé
+        # proche de la puissance de charge réelle (calibration.json) plutôt que d'une
+        # valeur arbitraire à l'ancienne échelle (~100W).
         self.log_tau_P = nn.Parameter(torch.log(torch.tensor(1.5)))
-        self.P_eq = nn.Parameter(torch.tensor(60.0))
+        self.P_eq = nn.Parameter(torch.tensor(float(p_eq_init)))
 
     def thermal_params(self):
         """Constantes physiques courantes (pour le résidu physique dans losses.py)."""
