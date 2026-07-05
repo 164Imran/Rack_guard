@@ -11,7 +11,10 @@ comes from Bloc A's simulator through agent.build_gpu_fleet().
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -25,12 +28,14 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from agent import (  # noqa: E402
+    DEFAULT_THRESHOLD_C,
     ForecastSummary,
     RackTelemetry,
     build_demo_case,
     build_gpu_fleet,
     build_inference_fleet,
     build_simulated_fleet,
+    classify_risk,
     evaluate_rack,
     execute_migration_plan,
     prediction_table,
@@ -130,6 +135,26 @@ INDEX_HTML = r"""<!doctype html>
       gap: 10px;
       flex-wrap: wrap;
     }
+    .mode-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+    .mode-btn {
+      min-height: 32px;
+      padding: 7px 10px;
+      background: transparent;
+      color: var(--muted);
+      border: 0;
+    }
+    .mode-btn.active {
+      background: var(--teal);
+      color: #fff;
+    }
     .toggle {
       display: flex;
       align-items: center;
@@ -158,6 +183,44 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: var(--shadow);
     }
     .panel { padding: 16px; }
+    .real-input-panel {
+      display: grid;
+      gap: 14px;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .field {
+      display: grid;
+      gap: 5px;
+    }
+    .field label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+    .field input, .field textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 9px 10px;
+      outline: none;
+    }
+    .dataset-box {
+      min-height: 122px;
+      resize: vertical;
+    }
+    .panel-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
     .summary {
       display: grid;
       grid-template-columns: repeat(4, minmax(130px, 1fr));
@@ -545,7 +608,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     @media (max-width: 760px) {
       header { height: auto; align-items: flex-start; flex-direction: column; padding: 14px 16px; }
-      .summary, .tables { grid-template-columns: 1fr; }
+      .summary, .tables, .form-grid { grid-template-columns: 1fr; }
       .app { padding: 12px; }
       .rack-grid { grid-template-columns: 1fr; }
     }
@@ -558,6 +621,10 @@ INDEX_HTML = r"""<!doctype html>
       <div class="subtle">Multi-GPU rack overheating forecast, diagnosis, and mitigation demo</div>
     </div>
     <div class="top-actions">
+      <div class="mode-switch" aria-label="Demo mode">
+        <button id="simulationModeBtn" class="mode-btn active" type="button">Simulation</button>
+        <button id="realModeBtn" class="mode-btn" type="button">Real Input</button>
+      </div>
       <label class="toggle"><input id="useCrusoe" type="checkbox" checked /> Nemotron evidence review</label>
       <button id="simulateBtn">Simulate Inference Workload</button>
       <span id="status" class="subtle">Ready</span>
@@ -569,6 +636,41 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel">
         <h2>Fleet Snapshot</h2>
         <div id="summary" class="summary"></div>
+      </section>
+
+      <section id="realInputPanel" class="panel real-input-panel hidden">
+        <div class="nav-row">
+          <div>
+            <h2>Real Input</h2>
+            <div class="subtle">Manual telemetry or JSON/CSV dataset</div>
+          </div>
+          <div class="panel-actions">
+            <button id="loadRealDemoBtn" class="secondary" type="button">Load Example</button>
+            <button id="analyzeRealBtn" type="button">Analyze Real Input</button>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="field"><label for="realRackId">Rack</label><input id="realRackId" value="rack-1" /></div>
+          <div class="field"><label for="realGpuId">GPU</label><input id="realGpuId" value="gpu-1" /></div>
+          <div class="field"><label for="realGpuTemp">GPU Temp C</label><input id="realGpuTemp" type="number" step="0.1" value="62" /></div>
+          <div class="field"><label for="realAssignedTraffic">Assigned Traffic %</label><input id="realAssignedTraffic" type="number" step="1" value="84" /></div>
+          <div class="field"><label for="realQueue">Queue Length</label><input id="realQueue" type="number" step="1" value="96" /></div>
+          <div class="field"><label for="realPower">GPU Power W</label><input id="realPower" type="number" step="1" value="335" /></div>
+          <div class="field"><label for="realSmUtil">SM Util %</label><input id="realSmUtil" type="number" step="1" value="91" /></div>
+          <div class="field"><label for="realMemUtil">Memory Util %</label><input id="realMemUtil" type="number" step="1" value="68" /></div>
+          <div class="field"><label for="realCoolingFlow">Cooling Flow LPM</label><input id="realCoolingFlow" type="number" step="0.01" value="0.58" /></div>
+          <div class="field"><label for="realFanSpeed">Fan Speed RPM</label><input id="realFanSpeed" type="number" step="1" value="5100" /></div>
+          <div class="field"><label for="realLatency">Network Latency MS</label><input id="realLatency" type="number" step="0.1" value="18" /></div>
+          <div class="field"><label for="realHeadroom">Safe Headroom %</label><input id="realHeadroom" type="number" step="1" value="18" /></div>
+        </div>
+        <div class="field">
+          <label for="realDataset">Dataset</label>
+          <textarea id="realDataset" class="dataset-box" placeholder='[{"rack_id":"rack-1","gpu_id":"gpu-1","gpu_temp_c":62,"assigned_traffic_pct":84,"inference_queue_len":96}]'></textarea>
+        </div>
+        <div class="panel-actions">
+          <input id="realDatasetFile" type="file" accept=".json,.csv,text/csv,application/json" />
+          <button id="clearRealBtn" class="secondary" type="button">Clear Real Input</button>
+        </div>
       </section>
 
       <section class="panel">
@@ -645,12 +747,23 @@ INDEX_HTML = r"""<!doctype html>
     let workloadDemand = null;
     let activeTab = "forecast";
     let viewMode = "racks";
+    let appMode = "simulation";
 
     const $ = (id) => document.getElementById(id);
     const riskRank = {SAFE: 1, WATCH: 2, HIGH: 3, CRITICAL: 4};
 
     function setStatus(text) {
       $("status").textContent = text || "";
+    }
+
+    function setMode(mode) {
+      appMode = mode;
+      $("simulationModeBtn").classList.toggle("active", mode === "simulation");
+      $("realModeBtn").classList.toggle("active", mode === "real");
+      $("realInputPanel").classList.toggle("hidden", mode !== "real");
+      $("simulateBtn").classList.toggle("hidden", mode !== "simulation");
+      setStatus(mode === "real" ? "Real input mode ready" : "Simulation mode ready");
+      renderChat(selectedGpu);
     }
 
     async function simulateFleet() {
@@ -680,6 +793,110 @@ INDEX_HTML = r"""<!doctype html>
       } finally {
         $("simulateBtn").disabled = false;
       }
+    }
+
+    function inputNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function realTelemetryFromForm() {
+      const assigned = inputNumber("realAssignedTraffic", 70);
+      const headroom = inputNumber("realHeadroom", Math.max(0, 72 - assigned));
+      const queue = inputNumber("realQueue", 0);
+      const sm = inputNumber("realSmUtil", 70);
+      const mem = inputNumber("realMemUtil", 55);
+      return {
+        rack_id: $("realRackId").value || "rack-1",
+        gpu_id: $("realGpuId").value || "gpu-1",
+        gpu_temp_c: inputNumber("realGpuTemp", 45),
+        ambient_temp_c: 24,
+        coolant_temp_c: 28,
+        cooling_flow_lpm: inputNumber("realCoolingFlow", 1.1),
+        cooling_command_pct: 85,
+        fan_speed_rpm: inputNumber("realFanSpeed", 6200),
+        fan_command_pct: 90,
+        gpu_power_w: inputNumber("realPower", 260),
+        psu_voltage_v: 12.0,
+        rack_power_kw: 5.2,
+        power_spike_ratio: sm >= 80 ? 1.35 : 1.08,
+        workload_type: sm >= 80 ? "high_spike_compute" : "steady_inference",
+        gpu_util_pct: Math.max(sm, mem),
+        sm_util_pct: sm,
+        memory_util_pct: mem,
+        inference_queue_len: queue,
+        network_latency_ms: inputNumber("realLatency", 8),
+        packet_loss_pct: 0.1,
+        request_rate_rps: Math.max(1, Math.round(assigned * 1.7 + queue * 0.2)),
+        active_batches: Math.max(1, Math.round(queue / 16)),
+        assigned_traffic_pct: assigned,
+        workload_demand_units: Math.round(assigned * 12 + queue * 3),
+        prompt_tokens: 1800,
+        output_tokens: 620,
+        alternative_capacity_pct: headroom,
+        latency_tolerance_ms: 45,
+        batch_jobs_present: queue > 80
+      };
+    }
+
+    async function fileToText(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = reject;
+        reader.readAsText(file);
+      });
+    }
+
+    async function analyzeRealInput() {
+      $("analyzeRealBtn").disabled = true;
+      setStatus("Analyzing real/operator telemetry...");
+      try {
+        const file = $("realDatasetFile").files[0];
+        const datasetText = file ? await fileToText(file) : $("realDataset").value.trim();
+        const body = datasetText
+          ? {dataset_text: datasetText, use_crusoe: $("useCrusoe").checked}
+          : {telemetry: realTelemetryFromForm(), use_crusoe: $("useCrusoe").checked};
+        const response = await fetch("/api/real-input", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Real input analysis failed");
+        racks = data.racks || [];
+        workloadDemand = data.workload || null;
+        selectedRack = null;
+        selectedGpu = null;
+        viewMode = "racks";
+        renderSummary();
+        renderMap();
+        renderTables(null);
+        renderChat(null);
+        $("detailsBtn").disabled = true;
+        setStatus("Real input analyzed at " + new Date(data.generated_at).toLocaleTimeString());
+      } catch (err) {
+        setStatus(err.message || String(err));
+      } finally {
+        $("analyzeRealBtn").disabled = false;
+      }
+    }
+
+    function loadRealExample() {
+      $("realDatasetFile").value = "";
+      $("realDataset").value = JSON.stringify([
+        {"rack_id":"rack-1","gpu_id":"gpu-1","gpu_temp_c":61.8,"assigned_traffic_pct":86,"alternative_capacity_pct":6,"inference_queue_len":112,"gpu_power_w":342,"sm_util_pct":93,"memory_util_pct":66,"cooling_flow_lpm":0.55,"fan_speed_rpm":5200,"network_latency_ms":19},
+        {"rack_id":"rack-1","gpu_id":"gpu-2","gpu_temp_c":57.2,"assigned_traffic_pct":78,"alternative_capacity_pct":12,"inference_queue_len":71,"gpu_power_w":303,"sm_util_pct":82,"memory_util_pct":61,"cooling_flow_lpm":0.82,"fan_speed_rpm":6500,"network_latency_ms":12},
+        {"rack_id":"rack-1","gpu_id":"gpu-3","gpu_temp_c":43.4,"assigned_traffic_pct":44,"alternative_capacity_pct":28,"inference_queue_len":8,"gpu_power_w":182,"sm_util_pct":46,"memory_util_pct":38,"cooling_flow_lpm":1.26,"fan_speed_rpm":5900,"network_latency_ms":5},
+        {"rack_id":"rack-2","gpu_id":"gpu-1","gpu_temp_c":39.8,"assigned_traffic_pct":34,"alternative_capacity_pct":38,"inference_queue_len":4,"gpu_power_w":151,"sm_util_pct":34,"memory_util_pct":35,"cooling_flow_lpm":1.31,"fan_speed_rpm":5700,"network_latency_ms":4}
+      ], null, 2);
+      setStatus("Example real dataset loaded");
+    }
+
+    function clearRealInput() {
+      $("realDataset").value = "";
+      $("realDatasetFile").value = "";
+      setStatus("Real input cleared");
     }
 
     function renderSummary() {
@@ -828,10 +1045,13 @@ INDEX_HTML = r"""<!doctype html>
       if (!item) {
         $("chatTitle").textContent = "GPU Copilot";
         $("chatSub").textContent = "Select a rack, then select one GPU.";
+        const workflowText = appMode === "real"
+          ? "Fill manual telemetry or paste a dataset, then analyze it. Open a rack and select a GPU for diagnosis and actions."
+          : "Click Simulate Inference Workload to generate an inference request, scheduler placement, telemetry, and forecast. Open a rack, then select a GPU for diagnosis and actions.";
         $("messages").innerHTML = `
           <div class="message">
             <div class="message-title">Workflow</div>
-            <div>Click <strong>Simulate Inference Workload</strong> to generate an inference request, scheduler placement, telemetry, and forecast. Open a rack, then select a GPU for diagnosis and actions.</div>
+            <div>${workflowText}</div>
           </div>
         `;
         return;
@@ -1356,6 +1576,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     $("simulateBtn").addEventListener("click", simulateFleet);
+    $("simulationModeBtn").addEventListener("click", () => setMode("simulation"));
+    $("realModeBtn").addEventListener("click", () => setMode("real"));
+    $("analyzeRealBtn").addEventListener("click", analyzeRealInput);
+    $("loadRealDemoBtn").addEventListener("click", loadRealExample);
+    $("clearRealBtn").addEventListener("click", clearRealInput);
     $("backBtn").addEventListener("click", backToRacks);
     $("detailsBtn").addEventListener("click", () => openModal("forecast"));
     $("runBtn").addEventListener("click", runAnalysis);
@@ -1399,6 +1624,261 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+FIELD_ALIASES = {
+    "rack": "rack_id",
+    "rackid": "rack_id",
+    "rack_id": "rack_id",
+    "gpu": "gpu_id",
+    "gpuid": "gpu_id",
+    "gpu_id": "gpu_id",
+    "temperature": "gpu_temp_c",
+    "temp": "gpu_temp_c",
+    "gpu_temp": "gpu_temp_c",
+    "gpu_temp_c": "gpu_temp_c",
+    "power": "gpu_power_w",
+    "gpu_power": "gpu_power_w",
+    "gpu_power_w": "gpu_power_w",
+    "queue": "inference_queue_len",
+    "queue_len": "inference_queue_len",
+    "inference_queue_len": "inference_queue_len",
+    "latency": "network_latency_ms",
+    "network_latency": "network_latency_ms",
+    "network_latency_ms": "network_latency_ms",
+    "traffic": "assigned_traffic_pct",
+    "assigned_traffic": "assigned_traffic_pct",
+    "assigned_traffic_pct": "assigned_traffic_pct",
+    "headroom": "alternative_capacity_pct",
+    "safe_headroom": "alternative_capacity_pct",
+    "alternative_capacity_pct": "alternative_capacity_pct",
+    "sm": "sm_util_pct",
+    "sm_util": "sm_util_pct",
+    "sm_util_pct": "sm_util_pct",
+    "memory": "memory_util_pct",
+    "memory_util": "memory_util_pct",
+    "memory_util_pct": "memory_util_pct",
+    "util": "gpu_util_pct",
+    "gpu_util": "gpu_util_pct",
+    "gpu_util_pct": "gpu_util_pct",
+    "cooling_flow": "cooling_flow_lpm",
+    "cooling_flow_lpm": "cooling_flow_lpm",
+    "fan_speed": "fan_speed_rpm",
+    "fan_speed_rpm": "fan_speed_rpm",
+    "ambient": "ambient_temp_c",
+    "ambient_temp_c": "ambient_temp_c",
+    "coolant": "coolant_temp_c",
+    "coolant_temp_c": "coolant_temp_c",
+}
+
+
+def _coerce_value(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return None
+        lowered = text.lower()
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        try:
+            number = float(text)
+        except ValueError:
+            return text
+        return int(number) if number.is_integer() else number
+    return value
+
+
+def _normalize_telemetry_row(row: dict[str, Any], index: int = 0) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in (row or {}).items():
+        alias = FIELD_ALIASES.get(str(key).strip().lower(), str(key).strip())
+        normalized[alias] = _coerce_value(value)
+
+    normalized.setdefault("rack_id", "rack-1")
+    normalized.setdefault("gpu_id", f"gpu-{index + 1}")
+    assigned = float(normalized.get("assigned_traffic_pct") or normalized.get("gpu_util_pct") or 45.0)
+    queue = float(normalized.get("inference_queue_len") or 0.0)
+    sm = float(normalized.get("sm_util_pct") or max(25.0, min(99.0, assigned + 6.0)))
+    mem = float(normalized.get("memory_util_pct") or max(20.0, min(95.0, assigned * 0.72)))
+
+    normalized.setdefault("gpu_temp_c", 28.0 + assigned * 0.32 + min(7.0, queue * 0.03))
+    normalized.setdefault("ambient_temp_c", 24.0)
+    normalized.setdefault("coolant_temp_c", 28.0)
+    normalized.setdefault("gpu_power_w", 65.0 + assigned * 3.2 + queue * 0.12)
+    normalized.setdefault("rack_power_kw", 5.0)
+    normalized.setdefault("fan_command_pct", 85.0)
+    normalized.setdefault("fan_speed_rpm", 6000.0)
+    normalized.setdefault("cooling_command_pct", 85.0)
+    normalized.setdefault("cooling_flow_lpm", 1.15)
+    normalized.setdefault("psu_voltage_v", 12.0)
+    normalized.setdefault("power_spike_ratio", 1.35 if sm >= 80 else 1.08)
+    normalized.setdefault("workload_type", "high_spike_compute" if sm >= 80 else "steady_inference")
+    normalized.setdefault("gpu_util_pct", max(sm, mem, assigned))
+    normalized.setdefault("sm_util_pct", sm)
+    normalized.setdefault("memory_util_pct", mem)
+    normalized.setdefault("network_latency_ms", 6.0)
+    normalized.setdefault("packet_loss_pct", 0.05)
+    normalized.setdefault("request_rate_rps", max(1.0, assigned * 1.6 + queue * 0.15))
+    normalized.setdefault("active_batches", max(1.0, math.ceil(queue / 16.0)))
+    normalized.setdefault("workload_demand_units", assigned * 12.0 + queue * 3.0)
+    normalized.setdefault("prompt_tokens", 1500)
+    normalized.setdefault("output_tokens", 550)
+    normalized.setdefault("alternative_capacity_pct", max(0.0, 72.0 - assigned))
+    normalized.setdefault("latency_tolerance_ms", 45.0)
+    normalized.setdefault("batch_jobs_present", queue > 80)
+    return normalized
+
+
+def _forecast_from_real_telemetry(telemetry: RackTelemetry) -> ForecastSummary:
+    current = float(telemetry.gpu_temp_c or 35.0)
+    threshold = DEFAULT_THRESHOLD_C
+    assigned = float(telemetry.assigned_traffic_pct or telemetry.gpu_util_pct or 45.0)
+    queue = float(telemetry.inference_queue_len or 0.0)
+    power = float(telemetry.gpu_power_w or (65.0 + assigned * 3.2))
+    cooling_flow = float(telemetry.cooling_flow_lpm or 1.15)
+    fan_speed = float(telemetry.fan_speed_rpm or 6000.0)
+    latency = float(telemetry.network_latency_ms or 5.0)
+
+    cooling_penalty = max(0.0, 1.0 - cooling_flow) * 9.0 + max(0.0, 5200.0 - fan_speed) / 900.0
+    load_penalty = max(0.0, assigned - 72.0) * 0.55
+    queue_penalty = min(10.0, queue * 0.045)
+    power_penalty = max(0.0, power - 260.0) * 0.026
+    latency_penalty = max(0.0, latency - 12.0) * 0.22
+    peak = max(current + 1.0, current + 2.0 + load_penalty + queue_penalty + power_penalty + cooling_penalty + latency_penalty)
+
+    horizon = 600.0
+    trajectory: list[dict[str, float]] = []
+    crossing = None
+    for step in range(0, 11):
+        t_s = step * 60.0
+        progress = 1.0 - math.exp(-t_s / 210.0)
+        temp = current + (peak - current) * progress
+        point_power = power * (1.0 + 0.03 * progress)
+        if crossing is None and temp >= threshold:
+            crossing = t_s
+        trajectory.append({
+            "t_s": round(t_s, 2),
+            "power_w": round(point_power, 3),
+            "gpu_temp_c": round(temp, 3),
+            "heatsink_temp_c": round(temp - 3.0, 3),
+        })
+
+    convergence = sum(point["gpu_temp_c"] for point in trajectory[-3:]) / 3.0
+    risk = classify_risk(current, peak, convergence, crossing, threshold)
+    confidence = 0.76 if telemetry.missing_fields else 0.84
+    return ForecastSummary(
+        threshold_c=threshold,
+        horizon_s=horizon,
+        current_temp_c=current,
+        peak_temp_c=round(peak, 3),
+        convergence_temp_c=round(convergence, 3),
+        time_to_threshold_s=crossing,
+        risk=risk,
+        confidence=confidence,
+        trajectory=trajectory,
+    )
+
+
+def _parse_dataset_text(text: str) -> list[dict[str, Any]]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+    if stripped[0] in "[{":
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict) and "racks" in parsed:
+            return parsed["racks"]
+        if isinstance(parsed, dict) and "telemetry" in parsed:
+            return [parsed["telemetry"]]
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return parsed
+        raise ValueError("JSON dataset must be an object or list")
+
+    reader = csv.DictReader(io.StringIO(stripped))
+    return [dict(row) for row in reader]
+
+
+def _evaluate_real_rows(rows: list[dict[str, Any]], use_crusoe: bool = False) -> dict[str, Any]:
+    if rows and isinstance(rows[0], dict) and "gpus" in rows[0]:
+        racks = rows
+        fleet = [gpu for rack in racks for gpu in rack.get("gpus", [])]
+        return _real_response(racks, fleet)
+
+    fleet: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        telemetry_data = _normalize_telemetry_row(row, index)
+        telemetry = RackTelemetry.from_dict(telemetry_data)
+        forecast = _forecast_from_real_telemetry(telemetry)
+        result = evaluate_rack(telemetry, forecast, use_crusoe=use_crusoe)
+        result["observed_table"] = telemetry_table(result["telemetry"])
+        result["prediction_table"] = prediction_table(ForecastSummary(**result["forecast"]))
+        fleet.append(result)
+
+    if not fleet:
+        raise ValueError("real input did not contain telemetry rows")
+
+    by_rack: dict[str, list[dict[str, Any]]] = {}
+    for gpu in fleet:
+        by_rack.setdefault(gpu["telemetry"].get("rack_id", "rack-1"), []).append(gpu)
+    racks = [_aggregate_real_rack(rack_id, gpus) for rack_id, gpus in sorted(by_rack.items())]
+    return _real_response(racks, fleet)
+
+
+def _aggregate_real_rack(rack_id: str, gpus: list[dict[str, Any]]) -> dict[str, Any]:
+    risks = [gpu["forecast"]["risk"] for gpu in gpus]
+    temps = [float(gpu["telemetry"].get("gpu_temp_c", 0.0)) for gpu in gpus]
+    rack_temp = sum(temps) / len(temps)
+    critical_count = risks.count("CRITICAL")
+    high_count = risks.count("HIGH")
+    watch_count = risks.count("WATCH")
+    safe_count = risks.count("SAFE")
+    half_gpu_count = len(gpus) / 2.0
+    rack_state = "CRITICAL" if critical_count > half_gpu_count else ("MEDIUM" if critical_count == half_gpu_count else "SAFE")
+    rack_temp_state = "CRITICAL" if rack_temp > 80.0 else ("MEDIUM" if rack_temp >= 50.0 else "SAFE")
+    top = sorted(gpus, key=lambda gpu: (
+        {"SAFE": 1, "WATCH": 2, "HIGH": 3, "CRITICAL": 4}.get(gpu["forecast"]["risk"], 0),
+        float(gpu["forecast"].get("peak_temp_c", 0.0)),
+    ), reverse=True)[0]
+    avg_assigned = sum(float(gpu["telemetry"].get("assigned_traffic_pct", 0.0) or 0.0) for gpu in gpus) / len(gpus)
+    headroom = sum(float(gpu["telemetry"].get("alternative_capacity_pct", 0.0) or 0.0) for gpu in gpus)
+    queued = sum(float(gpu["telemetry"].get("inference_queue_len", 0.0) or 0.0) for gpu in gpus)
+    return {
+        "rack_id": rack_id,
+        "gpu_count": len(gpus),
+        "critical_count": critical_count,
+        "high_count": high_count,
+        "watch_count": watch_count,
+        "safe_count": safe_count,
+        "rack_state": rack_state,
+        "rack_temp_state": rack_temp_state,
+        "rack_temp_c": round(rack_temp, 2),
+        "avg_gpu_temp_c": round(rack_temp, 2),
+        "max_gpu_temp_c": round(max(temps), 2),
+        "avg_assigned_traffic_pct": round(avg_assigned, 2),
+        "safe_headroom_pct": round(headroom, 2),
+        "queued_jobs": int(round(queued)),
+        "top_gpu_id": top["telemetry"].get("gpu_id"),
+        "top_risk": top["forecast"].get("risk"),
+        "dominant_cause": top["diagnosis"].get("likely_cause"),
+        "gpus": gpus,
+    }
+
+
+def _real_response(racks: list[dict[str, Any]], fleet: list[dict[str, Any]]) -> dict[str, Any]:
+    total_queue = sum(float(gpu["telemetry"].get("inference_queue_len", 0.0) or 0.0) for gpu in fleet)
+    total_demand = sum(float(gpu["telemetry"].get("workload_demand_units", 0.0) or 0.0) for gpu in fleet)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "real_input",
+        "workload": {
+            "request_type": "real_operator_input",
+            "queued_jobs": int(round(total_queue)),
+            "demand_units": round(total_demand, 2),
+        },
+        "racks": racks,
+        "fleet": fleet,
+    }
+
+
 class RackGuardianHandler(BaseHTTPRequestHandler):
     server_version = "RackGuardianDemo/0.2"
 
@@ -1423,6 +1903,9 @@ class RackGuardianHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/analyze":
                 self._send_json(self._handle_analyze(body))
+                return
+            if self.path == "/api/real-input":
+                self._send_json(self._handle_real_input(body))
                 return
             if self.path == "/api/propose-migration":
                 self._send_json(propose_migration_plan(body["source"], body.get("racks", [])))
@@ -1481,6 +1964,18 @@ class RackGuardianHandler(BaseHTTPRequestHandler):
         result["observed_table"] = telemetry_table(result["telemetry"])
         result["prediction_table"] = prediction_table(ForecastSummary(**result["forecast"]))
         return result
+
+    def _handle_real_input(self, body: dict[str, Any]) -> dict[str, Any]:
+        use_crusoe = bool(body.get("use_crusoe", False))
+        if body.get("dataset_text"):
+            rows = _parse_dataset_text(str(body["dataset_text"]))
+        elif body.get("racks"):
+            rows = body["racks"]
+        elif body.get("telemetry"):
+            rows = [body["telemetry"]]
+        else:
+            raise ValueError("real input requires telemetry, racks, or dataset_text")
+        return _evaluate_real_rows(rows, use_crusoe=use_crusoe)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
