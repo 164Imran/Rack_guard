@@ -17,6 +17,7 @@ import re
 import uuid
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -30,6 +31,9 @@ except ImportError:  # pragma: no cover - useful when run from rack_guardians/
 CRUSOE_BASE_URL = "https://api.inference.crusoecloud.com/v1/"
 CRUSOE_MODEL = "nvidia/Nemotron-3-Nano-Omni-Reasoning-30B-A3B"
 DEFAULT_THRESHOLD_C = float(getattr(simulator, "T_THRESH", 70.0))
+GPU_MAX_TRAFFIC_PCT = 100.0
+GPU_SAFE_TRAFFIC_PCT = 72.0
+GPU_RACK_SIZE = 8
 
 
 @dataclass
@@ -55,6 +59,12 @@ class RackTelemetry:
     sm_util_pct: Optional[float] = None
     memory_util_pct: Optional[float] = None
     inference_queue_len: Optional[int] = None
+    request_rate_rps: Optional[float] = None
+    active_batches: Optional[int] = None
+    assigned_traffic_pct: Optional[float] = None
+    workload_demand_units: Optional[float] = None
+    prompt_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
     network_latency_ms: Optional[float] = None
     packet_loss_pct: Optional[float] = None
     frequency_mhz: Optional[float] = None
@@ -297,6 +307,7 @@ def recommend_actions(
     risk_base = {"CRITICAL": 82.0, "HIGH": 66.0, "WATCH": 42.0, "SAFE": 12.0}.get(forecast.risk, 35.0)
     capacity = _safe_float(telemetry.alternative_capacity_pct, 0.0) or 0.0
     latency_tolerance = _safe_float(telemetry.latency_tolerance_ms, 0.0) or 0.0
+    queue = float(telemetry.inference_queue_len or 0)
 
     def score(action_id: str, label: str, reduction: float, latency: float, migration: float,
               sla: float, preference: float, impact: str, rationale: str, cost: str) -> ActionCandidate:
@@ -353,6 +364,18 @@ def recommend_actions(
             "low",
         ),
         score(
+            "add_gpu_rack_capacity",
+            "Add GPU rack capacity",
+            0.72 if capacity < 8 and queue >= 60 else 0.22,
+            0.0,
+            18.0,
+            4.0,
+            0.0,
+            "Expected to reduce sustained queue pressure when all nearby GPUs are already near safe load.",
+            "Best when thermal risk is driven by demand and there is not enough safe headroom to migrate traffic.",
+            "high",
+        ),
+        score(
             "escalate_technician",
             "Escalate technician inspection",
             0.30 if diagnosis.likely_cause in {
@@ -396,6 +419,13 @@ def recommend_actions(
         for candidate in candidates:
             if candidate.action_id in ("migrate_inference_traffic", "escalate_technician"):
                 candidate.score += 12.0
+
+    if capacity < 8 and queue >= 60 and diagnosis.likely_cause in {
+        "workload_induced_heating", "network_induced_queue_buildup", "unknown_thermal_risk"
+    }:
+        for candidate in candidates:
+            if candidate.action_id == "add_gpu_rack_capacity":
+                candidate.score += 28.0
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     secondary = []
@@ -710,6 +740,7 @@ def simulate_mitigation(result: dict[str, Any], action_id: Optional[str] = None)
         "apply_power_frequency_cap": 7.0,
         "increase_cooling_request": 4.0,
         "move_batch_jobs": 3.5,
+        "add_gpu_rack_capacity": 8.0,
         "escalate_technician": 0.5,
         "request_human_evidence": 0.0,
         "human_evidence_override": 6.0,
@@ -742,6 +773,421 @@ def simulate_mitigation(result: dict[str, Any], action_id: Optional[str] = None)
             "convergence_temp_c": round(conv_after, 2),
             "time_to_threshold_s": crossing_after,
         },
+    }
+
+
+def apply_mitigation_effect(
+    result: dict[str, Any],
+    mitigation: dict[str, Any],
+    plan: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return a copy of a GPU result with its future forecast updated."""
+    updated = deepcopy(result)
+    forecast = dict(updated.get("forecast", {}))
+    trajectory = list(forecast.get("trajectory") or [])
+    before = mitigation.get("before", {})
+    after = mitigation.get("after", {})
+    reduction = max(
+        0.0,
+        float(before.get("peak_temp_c", forecast.get("peak_temp_c", 0.0)))
+        - float(after.get("peak_temp_c", forecast.get("peak_temp_c", 0.0))),
+    )
+    traffic_percent = _safe_float((plan or {}).get("traffic_percent"), 0.0) or 0.0
+    power_fraction = _clip(traffic_percent / 100.0 * 0.55, 0.08, 0.28) if traffic_percent else 0.18
+    threshold = float(forecast.get("threshold_c", DEFAULT_THRESHOLD_C))
+    current = float(forecast.get("current_temp_c", 0.0))
+
+    new_points: list[dict[str, float]] = []
+    crossing_after: Optional[float] = None
+    for point in trajectory:
+        t_s = float(point.get("t_s", 0.0))
+        post = dict(point)
+        if t_s > 0.0:
+            post["gpu_temp_c"] = round(max(current, float(point.get("gpu_temp_c", current)) - reduction), 3)
+            if "heatsink_temp_c" in post:
+                post["heatsink_temp_c"] = round(
+                    max(current - 1.5, float(point.get("heatsink_temp_c", current)) - reduction * 0.75),
+                    3,
+                )
+            if "power_w" in post:
+                post["power_w"] = round(max(0.0, float(point.get("power_w", 0.0)) * (1.0 - power_fraction)), 3)
+        else:
+            post["gpu_temp_c"] = round(current, 3)
+        if crossing_after is None and float(post["gpu_temp_c"]) >= threshold:
+            crossing_after = t_s
+        new_points.append(post)
+
+    if new_points:
+        temps = [float(point["gpu_temp_c"]) for point in new_points]
+        peak = max(temps)
+        horizon = float(forecast.get("horizon_s", new_points[-1].get("t_s", 0.0)))
+        tail = temps[-min(len(temps), 24):]
+        convergence = sum(tail) / len(tail)
+    else:
+        peak = float(after.get("peak_temp_c", forecast.get("peak_temp_c", current)))
+        convergence = float(after.get("convergence_temp_c", forecast.get("convergence_temp_c", peak)))
+        horizon = float(forecast.get("horizon_s", 0.0))
+        crossing_after = after.get("time_to_threshold_s")
+
+    risk_after = classify_risk(current, peak, convergence, crossing_after, threshold)
+    forecast.update({
+        "peak_temp_c": round(peak, 3),
+        "convergence_temp_c": round(convergence, 3),
+        "time_to_threshold_s": crossing_after,
+        "risk": risk_after,
+        "confidence": round(max(0.50, float(forecast.get("confidence", 0.78)) - 0.03), 3),
+        "trajectory": new_points,
+        "horizon_s": horizon,
+    })
+    updated["forecast"] = forecast
+
+    telemetry_data = dict(updated.get("telemetry", {}))
+    if traffic_percent:
+        old_load = _safe_float(telemetry_data.get("assigned_traffic_pct"), 0.0) or 0.0
+        new_load = max(0.0, old_load - traffic_percent)
+        old_queue = float(telemetry_data.get("inference_queue_len") or 0.0)
+        load_ratio = new_load / max(old_load, 1.0)
+        telemetry_data["assigned_traffic_pct"] = round(new_load, 1)
+        telemetry_data["alternative_capacity_pct"] = round(max(0.0, GPU_SAFE_TRAFFIC_PCT - new_load), 1)
+        telemetry_data["inference_queue_len"] = int(round(old_queue * load_ratio))
+        telemetry_data["request_rate_rps"] = round((_safe_float(telemetry_data.get("request_rate_rps"), 0.0) or 0.0) * load_ratio, 2)
+        telemetry_data["gpu_util_pct"] = int(round(_clip((_safe_float(telemetry_data.get("gpu_util_pct"), 0.0) or 0.0) - traffic_percent * 0.75, 0.0, 99.0)))
+        telemetry_data["sm_util_pct"] = int(round(_clip((_safe_float(telemetry_data.get("sm_util_pct"), 0.0) or 0.0) - traffic_percent * 0.82, 0.0, 99.0)))
+        telemetry_data["gpu_power_w"] = round(max(55.0, (_safe_float(telemetry_data.get("gpu_power_w"), 55.0) or 55.0) * (1.0 - power_fraction)), 2)
+        telemetry_data["active_batches"] = max(1, int(round(float(telemetry_data.get("active_batches") or 1) * load_ratio)))
+    updated["telemetry"] = telemetry_data
+
+    telemetry = RackTelemetry.from_dict(telemetry_data)
+    forecast_obj = ForecastSummary(**forecast)
+    diagnosis = diagnose(telemetry, forecast_obj)
+    workload_class = classify_workload(telemetry)
+    recommendation = recommend_actions(telemetry, forecast_obj, diagnosis, workload_class)
+    updated["workload_class"] = workload_class
+    updated["diagnosis"] = asdict(diagnosis)
+    updated["recommendation"] = {
+        "primary_action": asdict(recommendation.primary_action),
+        "candidates": [asdict(candidate) for candidate in recommendation.candidates],
+        "secondary_actions": recommendation.secondary_actions,
+    }
+    updated["report"] = build_engineering_report(telemetry, forecast_obj, diagnosis, recommendation)
+    updated["observed_table"] = telemetry_table(telemetry_data)
+    updated["prediction_table"] = prediction_table(forecast_obj)
+    updated["prediction_source"] = "post_migration_simulation"
+    updated["mitigation_applied"] = {
+        "action_id": mitigation.get("action_id"),
+        "traffic_percent": traffic_percent,
+        "targets": (plan or {}).get("targets", []),
+        "before": before,
+        "after": {
+            "risk": risk_after,
+            "peak_temp_c": round(peak, 2),
+            "convergence_temp_c": round(convergence, 2),
+            "time_to_threshold_s": crossing_after,
+        },
+    }
+    return updated
+
+
+def apply_target_migration_load(target_result: dict[str, Any], traffic_share_pct: float) -> dict[str, Any]:
+    updated = deepcopy(target_result)
+    telemetry_data = dict(updated.get("telemetry", {}))
+    old_load = _safe_float(telemetry_data.get("assigned_traffic_pct"), 0.0) or 0.0
+    new_load = min(GPU_MAX_TRAFFIC_PCT, old_load + traffic_share_pct)
+    telemetry_data["assigned_traffic_pct"] = round(new_load, 1)
+    telemetry_data["alternative_capacity_pct"] = round(max(0.0, GPU_SAFE_TRAFFIC_PCT - new_load), 1)
+    telemetry_data["inference_queue_len"] = int(round(float(telemetry_data.get("inference_queue_len") or 0) + traffic_share_pct * 0.35))
+    telemetry_data["request_rate_rps"] = round((_safe_float(telemetry_data.get("request_rate_rps"), 0.0) or 0.0) + traffic_share_pct * 0.18, 2)
+    telemetry_data["gpu_util_pct"] = int(round(_clip((_safe_float(telemetry_data.get("gpu_util_pct"), 0.0) or 0.0) + traffic_share_pct * 0.72, 0.0, 99.0)))
+    telemetry_data["sm_util_pct"] = int(round(_clip((_safe_float(telemetry_data.get("sm_util_pct"), 0.0) or 0.0) + traffic_share_pct * 0.78, 0.0, 99.0)))
+    telemetry_data["gpu_power_w"] = round((_safe_float(telemetry_data.get("gpu_power_w"), 70.0) or 70.0) + traffic_share_pct * 2.4, 2)
+    telemetry_data["active_batches"] = max(1, int(round(float(telemetry_data.get("active_batches") or 1) + traffic_share_pct / 10.0)))
+    updated["telemetry"] = telemetry_data
+
+    forecast = dict(updated.get("forecast", {}))
+    trajectory = list(forecast.get("trajectory") or [])
+    current = float(forecast.get("current_temp_c", telemetry_data.get("gpu_temp_c", simulator.T_AMB)))
+    threshold = float(forecast.get("threshold_c", DEFAULT_THRESHOLD_C))
+    uplift = traffic_share_pct * 0.14
+    crossing = None
+    new_points: list[dict[str, float]] = []
+    for point in trajectory:
+        t_s = float(point.get("t_s", 0.0))
+        progress = 1.0 - math.exp(-t_s / 180.0)
+        post = dict(point)
+        if t_s > 0.0:
+            post["gpu_temp_c"] = round(float(point.get("gpu_temp_c", current)) + uplift * progress, 3)
+            if "heatsink_temp_c" in post:
+                post["heatsink_temp_c"] = round(float(point.get("heatsink_temp_c", current - 3.0)) + uplift * 0.65 * progress, 3)
+            if "power_w" in post:
+                post["power_w"] = round(float(point.get("power_w", telemetry_data["gpu_power_w"])) + traffic_share_pct * 2.4, 3)
+        if crossing is None and float(post["gpu_temp_c"]) >= threshold:
+            crossing = t_s
+        new_points.append(post)
+
+    if new_points:
+        temps = [float(point["gpu_temp_c"]) for point in new_points]
+        peak = max(temps)
+        tail = temps[-min(len(temps), 12):]
+        convergence = sum(tail) / len(tail)
+    else:
+        peak = float(forecast.get("peak_temp_c", current))
+        convergence = float(forecast.get("convergence_temp_c", peak))
+    risk = classify_risk(current, peak, convergence, crossing, threshold)
+    forecast.update({
+        "peak_temp_c": round(peak, 3),
+        "convergence_temp_c": round(convergence, 3),
+        "time_to_threshold_s": crossing,
+        "risk": risk,
+        "trajectory": new_points,
+    })
+    updated["forecast"] = forecast
+
+    telemetry = RackTelemetry.from_dict(telemetry_data)
+    forecast_obj = ForecastSummary(**forecast)
+    diagnosis = diagnose(telemetry, forecast_obj)
+    workload_class = classify_workload(telemetry)
+    recommendation = recommend_actions(telemetry, forecast_obj, diagnosis, workload_class)
+    updated["workload_class"] = workload_class
+    updated["diagnosis"] = asdict(diagnosis)
+    updated["recommendation"] = {
+        "primary_action": asdict(recommendation.primary_action),
+        "candidates": [asdict(candidate) for candidate in recommendation.candidates],
+        "secondary_actions": recommendation.secondary_actions,
+    }
+    updated["report"] = build_engineering_report(telemetry, forecast_obj, diagnosis, recommendation)
+    updated["observed_table"] = telemetry_table(telemetry_data)
+    updated["prediction_table"] = prediction_table(forecast_obj)
+    updated["prediction_source"] = "post_migration_target_load"
+    updated["received_migration"] = {"traffic_share_pct": round(traffic_share_pct, 1)}
+    return updated
+
+
+def _gpu_identity(result: dict[str, Any]) -> tuple[str, str]:
+    telemetry = result.get("telemetry", {}) if isinstance(result, dict) else {}
+    return str(telemetry.get("rack_id", "")), str(telemetry.get("gpu_id", ""))
+
+
+def _iter_fleet_gpus(racks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
+    for rack in racks or []:
+        if not isinstance(rack, dict):
+            continue
+        for gpu in rack.get("gpus", []) or []:
+            if isinstance(gpu, dict) and isinstance(gpu.get("telemetry"), dict):
+                gpus.append(gpu)
+    return gpus
+
+
+def _find_gpu_result(racks: list[dict[str, Any]], rack_id: Any, gpu_id: Any) -> Optional[dict[str, Any]]:
+    for gpu in _iter_fleet_gpus(racks):
+        telemetry = gpu.get("telemetry", {})
+        if telemetry.get("rack_id") == rack_id and telemetry.get("gpu_id") == gpu_id:
+            return gpu
+    return None
+
+
+def propose_migration_plan(
+    source_result: dict[str, Any],
+    racks: list[dict[str, Any]],
+    min_target_capacity_pct: float = 18.0,
+    max_targets: int = 2,
+) -> dict[str, Any]:
+    """Find safe target GPUs for an operator-approved traffic migration.
+
+    This stays deterministic on purpose: the LLM may explain the plan, but the
+    control decision is bounded by telemetry, capacity, and explicit approval.
+    """
+    if not isinstance(source_result, dict) or not source_result.get("telemetry"):
+        raise ValueError("source GPU result is required")
+
+    source_t = source_result.get("telemetry", {})
+    source_f = source_result.get("forecast", {})
+    source_key = _gpu_identity(source_result)
+    threshold = _safe_float(source_f.get("threshold_c"), DEFAULT_THRESHOLD_C) or DEFAULT_THRESHOLD_C
+    source_load = _safe_float(source_t.get("assigned_traffic_pct"), 0.0) or 0.0
+    source_queue = _safe_float(source_t.get("inference_queue_len"), 0.0) or 0.0
+    source_excess = max(0.0, source_load - GPU_SAFE_TRAFFIC_PCT)
+
+    candidates: list[dict[str, Any]] = []
+    for gpu in _iter_fleet_gpus(racks):
+        if _gpu_identity(gpu) == source_key:
+            continue
+
+        telemetry = gpu.get("telemetry", {})
+        forecast = gpu.get("forecast", {})
+        risk = str(forecast.get("risk", "")).upper()
+        current_temp = _safe_float(telemetry.get("gpu_temp_c"), 999.0) or 999.0
+        peak_temp = _safe_float(forecast.get("peak_temp_c"), 999.0) or 999.0
+        capacity = _safe_float(telemetry.get("alternative_capacity_pct"), 0.0) or 0.0
+        assigned_load = _safe_float(telemetry.get("assigned_traffic_pct"), 0.0) or 0.0
+        latency = _safe_float(telemetry.get("network_latency_ms"), 999.0) or 999.0
+
+        if risk != "SAFE":
+            continue
+        if capacity < min_target_capacity_pct:
+            continue
+        if current_temp >= threshold - 12.0 or peak_temp >= threshold - 4.0:
+            continue
+
+        different_rack_bonus = 6.0 if telemetry.get("rack_id") != source_t.get("rack_id") else 0.0
+        score = capacity * 2.0 - current_temp * 0.7 - latency * 0.08 + different_rack_bonus
+        candidates.append({
+            "rack_id": telemetry.get("rack_id"),
+            "gpu_id": telemetry.get("gpu_id"),
+            "risk": risk,
+            "current_temp_c": round(current_temp, 2),
+            "peak_temp_c": round(peak_temp, 2),
+            "assigned_traffic_pct": round(assigned_load, 1),
+            "available_capacity_pct": round(capacity, 1),
+            "network_latency_ms": round(latency, 1),
+            "candidate_score": round(score, 2),
+        })
+
+    candidates.sort(key=lambda item: item["candidate_score"], reverse=True)
+    targets = candidates[:max(1, min(max_targets, len(candidates)))]
+
+    mitigation = simulate_mitigation(source_result, "migrate_inference_traffic")
+    if not targets:
+        return {
+            "plan_id": str(uuid.uuid4()),
+            "available": False,
+            "requires_approval": True,
+            "status": "no_safe_target",
+            "action_id": "migrate_inference_traffic",
+            "source": {
+                "rack_id": source_t.get("rack_id"),
+                "gpu_id": source_t.get("gpu_id"),
+                "risk": source_f.get("risk"),
+                "current_temp_c": source_t.get("gpu_temp_c"),
+                "peak_temp_c": source_f.get("peak_temp_c"),
+                "assigned_traffic_pct": source_load,
+                "queue_len": source_queue,
+            },
+            "reason": (
+                f"No SAFE target GPU has at least {min_target_capacity_pct:.0f}% available capacity "
+                "while staying comfortably below the thermal threshold. Add GPU rack capacity or reduce incoming demand."
+            ),
+            "scale_recommendation": _scale_recommendation(source_result, racks),
+            "expected": mitigation,
+        }
+
+    total_capacity = sum(float(target["available_capacity_pct"]) for target in targets)
+    queue_pressure = min(14.0, source_queue / 18.0)
+    desired_relief = max(12.0, source_excess + queue_pressure)
+    traffic_percent = int(round(_clip(min(desired_relief, total_capacity * 0.75), 15.0, 40.0)))
+    remaining = traffic_percent
+    for idx, target in enumerate(targets):
+        if idx == len(targets) - 1:
+            target["traffic_share_pct"] = remaining
+        else:
+            share = int(round(traffic_percent * float(target["available_capacity_pct"]) / total_capacity))
+            share = max(5, min(share, remaining - 5 * (len(targets) - idx - 1)))
+            target["traffic_share_pct"] = share
+            remaining -= share
+
+    return {
+        "plan_id": str(uuid.uuid4()),
+        "available": True,
+        "requires_approval": True,
+        "status": "awaiting_engineer_approval",
+        "action_id": "migrate_inference_traffic",
+        "source": {
+            "rack_id": source_t.get("rack_id"),
+            "gpu_id": source_t.get("gpu_id"),
+            "risk": source_f.get("risk"),
+            "current_temp_c": source_t.get("gpu_temp_c"),
+            "peak_temp_c": source_f.get("peak_temp_c"),
+            "assigned_traffic_pct": source_load,
+            "queue_len": source_queue,
+        },
+        "targets": targets,
+        "traffic_percent": traffic_percent,
+        "basis": {
+            "source_assigned_traffic_pct": round(source_load, 1),
+            "source_safe_load_pct": GPU_SAFE_TRAFFIC_PCT,
+            "source_excess_pct": round(source_excess, 1),
+            "source_queue_len": round(source_queue, 1),
+            "target_safe_headroom_pct": round(total_capacity, 1),
+            "formula": "min(source excess + queue pressure, 75% of target safe headroom), clipped to 15-40%",
+        },
+        "expected": mitigation,
+        "guardrails": [
+            "Requires explicit engineer approval before applying.",
+            "Drain traffic gradually and keep live latency within the configured tolerance.",
+            "Do not use targets that are already HIGH or CRITICAL risk.",
+            "Rollback if target temperature or inference latency rises unexpectedly.",
+            "Keep any facility inspection ticket open when the likely cause is hardware or cooling related.",
+        ],
+    }
+
+
+def _scale_recommendation(source_result: dict[str, Any], racks: list[dict[str, Any]]) -> dict[str, Any]:
+    fleet = _iter_fleet_gpus(racks)
+    total_safe_headroom = sum(
+        _safe_float(gpu.get("telemetry", {}).get("alternative_capacity_pct"), 0.0) or 0.0
+        for gpu in fleet
+    )
+    source_queue = _safe_float(source_result.get("telemetry", {}).get("inference_queue_len"), 0.0) or 0.0
+    source_load = _safe_float(source_result.get("telemetry", {}).get("assigned_traffic_pct"), 0.0) or 0.0
+    estimated_needed_pct = max(0.0, source_load - GPU_SAFE_TRAFFIC_PCT) + min(30.0, source_queue / 8.0)
+    missing_headroom = max(0.0, estimated_needed_pct - total_safe_headroom)
+    additional_gpus = int(math.ceil(missing_headroom / GPU_SAFE_TRAFFIC_PCT)) if missing_headroom else 0
+    return {
+        "label": "Add GPU rack capacity",
+        "total_safe_headroom_pct": round(total_safe_headroom, 1),
+        "estimated_missing_headroom_pct": round(missing_headroom, 1),
+        "additional_gpus_needed": additional_gpus,
+        "additional_racks_needed": int(math.ceil(additional_gpus / GPU_RACK_SIZE)) if additional_gpus else 0,
+        "reason": "Existing safe headroom is not enough to drain the queued high-compute inference load.",
+    }
+
+
+def execute_migration_plan(
+    source_result: dict[str, Any],
+    plan: dict[str, Any],
+    racks: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Approve and simulate a migration plan.
+
+    The demo never talks to real schedulers or networking controllers. A
+    production integration would replace this function with an audited adapter.
+    """
+    if not isinstance(plan, dict) or not plan.get("available"):
+        return {
+            "executed": False,
+            "mode": "simulation_only",
+            "status": "not_executed",
+            "reason": plan.get("reason", "Migration plan is not available.") if isinstance(plan, dict) else "Invalid plan.",
+        }
+
+    mitigation = simulate_mitigation(source_result, "migrate_inference_traffic")
+    updated_result = apply_mitigation_effect(source_result, mitigation, plan)
+    actual_after = updated_result.get("mitigation_applied", {}).get("after", mitigation["after"])
+    target_updates = []
+    if racks:
+        for target in plan.get("targets", []) or []:
+            target_result = _find_gpu_result(racks, target.get("rack_id"), target.get("gpu_id"))
+            if target_result:
+                target_updates.append(apply_target_migration_load(target_result, float(target.get("traffic_share_pct") or 0.0)))
+
+    return {
+        "executed": True,
+        "mode": "simulation_only",
+        "status": "approved_and_simulated",
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+        "plan_id": plan.get("plan_id"),
+        "action_id": "migrate_inference_traffic",
+        "source": plan.get("source", {}),
+        "targets": plan.get("targets", []),
+        "traffic_percent": plan.get("traffic_percent"),
+        "before": mitigation["before"],
+        "after": actual_after,
+        "updated_result": updated_result,
+        "target_updates": target_updates,
+        "notes": [
+            "This demo updates the selected GPU's post-migration forecast; it does not operate real infrastructure.",
+            "In production, the same approval would call an audited scheduler or traffic router adapter.",
+        ],
     }
 
 
@@ -840,13 +1286,259 @@ def build_simulated_fleet(count: int = 12, seed: Optional[int] = None) -> list[d
     return [gpu for rack in racks for gpu in rack["gpus"]][:count]
 
 
-def build_gpu_fleet(rack_count: int = 3, gpus_per_rack: int = 8, seed: Optional[int] = None) -> list[dict[str, Any]]:
-    """Create a 3-rack x 8-GPU snapshot for the demo UI.
+def build_inference_fleet(
+    rack_count: int = 3,
+    gpus_per_rack: int = 8,
+    seed: Optional[int] = None,
+) -> dict[str, Any]:
+    """Create a workload-first fleet snapshot for the demo UI."""
+    rng = random.Random(seed)
+    workload = _simulate_inference_workload(rack_count, gpus_per_rack, rng)
+    schedule = _schedule_inference_workload(workload, rack_count, gpus_per_rack, rng)
+    racks = []
 
-    The thermal curve still comes from Bloc A's simulator. The additional
-    telemetry is intentionally synthetic and optional, mirroring the data we
-    expect Bloc A or production collectors to provide later.
-    """
+    for rack_idx in range(1, rack_count + 1):
+        gpus = []
+        for gpu_idx in range(1, gpus_per_rack + 1):
+            state = schedule[(rack_idx, gpu_idx)]
+            telemetry, forecast, case_type = _build_workload_driven_case(
+                rack_id=f"rack-{rack_idx}",
+                gpu_id=f"gpu-{gpu_idx}",
+                workload=workload,
+                state=state,
+                rng=rng,
+            )
+            result = evaluate_rack(telemetry, forecast, use_crusoe=False)
+            result["simulated_case"] = case_type
+            result["prediction_source"] = "workload_driven_thermal_simulation"
+            result["workload_request"] = workload
+            result["scheduler_state"] = state
+            result["observed_table"] = telemetry_table(asdict(telemetry))
+            result["prediction_table"] = prediction_table(forecast)
+            gpus.append(result)
+        rack = _aggregate_gpu_rack(f"rack-{rack_idx}", gpus)
+        rack["scheduler_policy"] = workload["scheduler_policy"]
+        racks.append(rack)
+
+    return {"racks": racks, "workload": workload}
+
+
+def build_gpu_fleet(rack_count: int = 3, gpus_per_rack: int = 8, seed: Optional[int] = None) -> list[dict[str, Any]]:
+    """Create a 3-rack x 8-GPU snapshot for compatibility callers."""
+    return build_inference_fleet(rack_count=rack_count, gpus_per_rack=gpus_per_rack, seed=seed)["racks"]
+
+
+def _simulate_inference_workload(rack_count: int, gpus_per_rack: int, rng: random.Random) -> dict[str, Any]:
+    safe_capacity = rack_count * gpus_per_rack * GPU_SAFE_TRAFFIC_PCT
+    request_type = rng.choice([
+        "prompt_burst",
+        "queued_high_compute_inference",
+        "batch_inference_spike",
+        "mixed_prompt_and_batch",
+    ])
+    demand_factor = {
+        "prompt_burst": rng.uniform(0.78, 1.08),
+        "queued_high_compute_inference": rng.uniform(0.96, 1.34),
+        "batch_inference_spike": rng.uniform(0.72, 1.18),
+        "mixed_prompt_and_batch": rng.uniform(0.84, 1.26),
+    }[request_type]
+    demand_units = round(safe_capacity * demand_factor, 1)
+    prompt_jobs = rng.randint(180, 900)
+    batch_jobs = rng.randint(8, 70) if "batch" in request_type or request_type == "mixed_prompt_and_batch" else rng.randint(0, 18)
+    queued_jobs = int(max(20, demand_units - safe_capacity) * rng.uniform(0.18, 0.42) + rng.randint(25, 180))
+    avg_prompt_tokens = rng.choice([512, 768, 1024, 1536, 2048, 3072])
+    avg_output_tokens = rng.choice([128, 256, 384, 512, 768])
+    request_rate_rps = round(demand_units / rng.uniform(32.0, 58.0), 1)
+    required_safe_racks = int(math.ceil(demand_units / max(1.0, gpus_per_rack * GPU_SAFE_TRAFFIC_PCT)))
+
+    return {
+        "workload_id": f"req-{uuid.uuid4().hex[:8]}",
+        "request_type": request_type,
+        "scheduler_policy": "rack-first packing with spillover",
+        "demand_units": demand_units,
+        "safe_capacity_units": round(safe_capacity, 1),
+        "required_safe_racks": required_safe_racks,
+        "extra_racks_needed": max(0, required_safe_racks - rack_count),
+        "prompt_jobs": prompt_jobs,
+        "batch_jobs": batch_jobs,
+        "queued_jobs": queued_jobs,
+        "avg_prompt_tokens": avg_prompt_tokens,
+        "avg_output_tokens": avg_output_tokens,
+        "request_rate_rps": request_rate_rps,
+        "packing_limit_pct": round(rng.uniform(86.0, 94.0), 1),
+        "safe_gpu_load_pct": GPU_SAFE_TRAFFIC_PCT,
+    }
+
+
+def _schedule_inference_workload(
+    workload: dict[str, Any],
+    rack_count: int,
+    gpus_per_rack: int,
+    rng: random.Random,
+) -> dict[tuple[int, int], dict[str, Any]]:
+    remaining = float(workload["demand_units"])
+    packing_limit = float(workload["packing_limit_pct"])
+    states: dict[tuple[int, int], dict[str, Any]] = {}
+
+    for rack_idx in range(1, rack_count + 1):
+        for gpu_idx in range(1, gpus_per_rack + 1):
+            if remaining > 0:
+                fill_limit = _clip(packing_limit + rng.uniform(-5.5, 4.5), 68.0, GPU_MAX_TRAFFIC_PCT)
+                assigned = min(fill_limit, remaining)
+                remaining -= assigned
+            else:
+                assigned = rng.uniform(4.0, 18.0)
+
+            states[(rack_idx, gpu_idx)] = {
+                "rack_id": f"rack-{rack_idx}",
+                "gpu_id": f"gpu-{gpu_idx}",
+                "assigned_traffic_pct": round(assigned, 1),
+                "safe_headroom_pct": round(max(0.0, GPU_SAFE_TRAFFIC_PCT - assigned), 1),
+                "scheduler_order": (rack_idx - 1) * gpus_per_rack + gpu_idx,
+                "spillover": rack_idx > 1,
+            }
+
+    pressure_sum = sum(
+        max(0.0, state["assigned_traffic_pct"] - GPU_SAFE_TRAFFIC_PCT)
+        for state in states.values()
+    )
+    total_queue = int(workload["queued_jobs"])
+    for state in states.values():
+        overload = max(0.0, state["assigned_traffic_pct"] - GPU_SAFE_TRAFFIC_PCT)
+        if pressure_sum > 0:
+            queue = int(round(total_queue * overload / pressure_sum)) + rng.randint(0, 8)
+        else:
+            queue = rng.randint(2, 22)
+        state["queue_len"] = max(0, queue)
+        state["load_state"] = (
+            "overloaded" if state["assigned_traffic_pct"] >= 86.0
+            else "busy" if state["assigned_traffic_pct"] >= GPU_SAFE_TRAFFIC_PCT
+            else "available"
+        )
+    return states
+
+
+def _build_workload_driven_case(
+    rack_id: str,
+    gpu_id: str,
+    workload: dict[str, Any],
+    state: dict[str, Any],
+    rng: random.Random,
+) -> tuple[RackTelemetry, ForecastSummary, str]:
+    load = float(state["assigned_traffic_pct"])
+    queue = int(state["queue_len"])
+    request_rate = float(workload["request_rate_rps"]) * max(0.03, load / max(1.0, float(workload["demand_units"]))) * GPU_RACK_SIZE
+    ambient = float(simulator.T_AMB) + rng.uniform(-0.8, 1.8)
+    coolant = 23.0 + rng.uniform(-1.0, 2.4)
+    current_temp = ambient + 3.2 + load * 0.34 + min(8.0, queue * 0.025) + rng.uniform(-1.4, 1.6)
+    current_temp = round(_clip(current_temp, ambient + 2.0, DEFAULT_THRESHOLD_C - 1.0), 2)
+    power = round(_clip(55.0 + load * 3.35 + queue * 0.18 + rng.uniform(-9.0, 12.0), 55.0, 420.0), 2)
+    fan_command = int(_clip(35.0 + load * 0.58 + queue * 0.05, 35.0, 100.0))
+    cooling_command = int(_clip(38.0 + load * 0.55 + queue * 0.04, 35.0, 100.0))
+    sm_util = int(_clip(load + rng.uniform(2.0, 12.0), 10.0, 99.0))
+    memory_util = int(_clip(32.0 + load * rng.uniform(0.28, 0.48), 18.0, 96.0))
+    gpu_util = int(_clip(load + rng.uniform(0.0, 8.0), 8.0, 99.0))
+    network_latency = round(12.0 + queue * 0.42 + max(0.0, load - GPU_SAFE_TRAFFIC_PCT) * 0.65 + rng.uniform(-3.0, 8.0), 1)
+
+    telemetry = RackTelemetry(
+        rack_id=rack_id,
+        gpu_id=gpu_id,
+        gpu_temp_c=current_temp,
+        heatsink_temp_c=round(current_temp - rng.uniform(2.0, 4.8), 2),
+        ambient_temp_c=round(ambient, 2),
+        coolant_temp_c=round(coolant, 2),
+        fan_speed_rpm=int(_clip(fan_command * 165 + rng.randint(-650, 850), 3200, 16500)),
+        fan_command_pct=fan_command,
+        cooling_flow_lpm=round(_clip(0.72 + cooling_command / 100.0 * 0.72 + rng.uniform(-0.08, 0.08), 0.52, 1.55), 2),
+        cooling_command_pct=cooling_command,
+        gpu_power_w=power,
+        rack_power_kw=round(5.2 + power / 1000.0 * GPU_RACK_SIZE, 2),
+        psu_voltage_v=round(12.05 + rng.uniform(-0.12, 0.10), 2),
+        psu_voltage_std_v=round(rng.uniform(0.03, 0.10), 2),
+        power_spike_ratio=round(1.06 + max(0.0, load - 50.0) / 125.0 + queue / 900.0, 2),
+        workload_type=workload["request_type"].replace("_", " "),
+        gpu_util_pct=gpu_util,
+        sm_util_pct=sm_util,
+        memory_util_pct=memory_util,
+        inference_queue_len=queue,
+        request_rate_rps=round(request_rate, 2),
+        active_batches=max(1, int(round(load / 9.0 + queue / 45.0))),
+        assigned_traffic_pct=round(load, 1),
+        workload_demand_units=float(workload["demand_units"]),
+        prompt_tokens=int(workload["avg_prompt_tokens"]),
+        output_tokens=int(workload["avg_output_tokens"]),
+        network_latency_ms=network_latency,
+        packet_loss_pct=round(_clip(queue / 280.0 + rng.uniform(0.0, 0.18), 0.0, 3.0), 2),
+        frequency_mhz=int(_clip(1530 - max(0.0, current_temp - 58.0) * 10.0 + rng.randint(-35, 45), 1040, 1585)),
+        sensor_age_s=rng.randint(3, 22),
+        alternative_capacity_pct=round(max(0.0, GPU_SAFE_TRAFFIC_PCT - load), 1),
+        latency_tolerance_ms=rng.choice([20, 35, 50]),
+        batch_jobs_present=workload["batch_jobs"] > 0,
+        missing_fields=[],
+    )
+    forecast = _forecast_from_workload(telemetry, workload, state, rng)
+    case_type = "workload_queue_pressure" if queue >= 60 else "workload_heat" if load >= GPU_SAFE_TRAFFIC_PCT else "available_capacity"
+    return telemetry, forecast, case_type
+
+
+def _forecast_from_workload(
+    telemetry: RackTelemetry,
+    workload: dict[str, Any],
+    state: dict[str, Any],
+    rng: random.Random,
+) -> ForecastSummary:
+    load = _safe_float(telemetry.assigned_traffic_pct, 0.0) or 0.0
+    queue = float(telemetry.inference_queue_len or 0)
+    current = float(telemetry.gpu_temp_c or simulator.T_AMB)
+    threshold = DEFAULT_THRESHOLD_C
+    horizon = rng.choice([420.0, 480.0, 540.0, 600.0])
+    overload = max(0.0, load - GPU_SAFE_TRAFFIC_PCT)
+    peak_delta = 2.0 + overload * 0.58 + min(13.0, queue * 0.055) + max(0.0, load - 55.0) * 0.08
+    if workload["extra_racks_needed"] > 0:
+        peak_delta += min(7.0, workload["extra_racks_needed"] * 3.0)
+    peak = max(current + 1.0, current + peak_delta + rng.uniform(-1.0, 1.4))
+    if load < 45.0 and queue < 15:
+        peak = min(peak, threshold - rng.uniform(10.0, 18.0))
+
+    points = []
+    crossing = None
+    base_power = float(telemetry.gpu_power_w or 80.0)
+    for idx in range(0, int(horizon) + 1, 10):
+        progress = 1.0 - math.exp(-idx / max(90.0, horizon * 0.34))
+        temp = current + (peak - current) * progress
+        temp += math.sin(idx / 55.0) * 0.35
+        temp = round(max(current, temp), 3)
+        power_wave = 1.0 + math.sin(idx / 47.0) * 0.035
+        point = {
+            "t_s": float(idx),
+            "power_w": round(base_power * power_wave, 3),
+            "gpu_temp_c": temp,
+            "heatsink_temp_c": round(max(current - 3.0, temp - 3.2), 3),
+        }
+        if crossing is None and temp >= threshold:
+            crossing = float(idx)
+        points.append(point)
+
+    temps = [point["gpu_temp_c"] for point in points]
+    tail = temps[-min(len(temps), 12):]
+    convergence = sum(tail) / len(tail)
+    risk = classify_risk(current, max(temps), convergence, crossing, threshold)
+    confidence = 0.78 + min(0.14, abs(load - GPU_SAFE_TRAFFIC_PCT) / 120.0) + rng.random() * 0.04
+    return ForecastSummary(
+        threshold_c=threshold,
+        horizon_s=horizon,
+        current_temp_c=current,
+        peak_temp_c=max(temps),
+        convergence_temp_c=convergence,
+        time_to_threshold_s=crossing,
+        risk=risk,
+        confidence=round(_clip(confidence, 0.70, 0.94), 3),
+        trajectory=points,
+    )
+
+
+def _legacy_random_gpu_fleet(rack_count: int, gpus_per_rack: int, seed: Optional[int] = None) -> list[dict[str, Any]]:
+    """Older incident-mix simulator kept as a local fallback/reference."""
     rng = random.Random(seed)
     incident_mix = [
         "normal",
@@ -886,6 +1578,11 @@ def build_gpu_fleet(rack_count: int = 3, gpus_per_rack: int = 8, seed: Optional[
 def telemetry_table(telemetry: dict[str, Any]) -> list[dict[str, Any]]:
     rows = [
         ("GPU", telemetry.get("gpu_id"), ""),
+        ("Workload type", telemetry.get("workload_type"), ""),
+        ("Assigned inference traffic", telemetry.get("assigned_traffic_pct"), "%"),
+        ("Safe traffic headroom", telemetry.get("alternative_capacity_pct"), "%"),
+        ("Request rate", telemetry.get("request_rate_rps"), "req/s"),
+        ("Active batches", telemetry.get("active_batches"), "batches"),
         ("GPU temp", telemetry.get("gpu_temp_c"), "C"),
         ("Ambient temp", telemetry.get("ambient_temp_c"), "C"),
         ("Coolant temp", telemetry.get("coolant_temp_c"), "C"),
@@ -899,6 +1596,8 @@ def telemetry_table(telemetry: dict[str, Any]) -> list[dict[str, Any]]:
         ("Network latency", telemetry.get("network_latency_ms"), "ms"),
         ("SM utilization", telemetry.get("sm_util_pct"), "%"),
         ("Memory utilization", telemetry.get("memory_util_pct"), "%"),
+        ("Prompt tokens", telemetry.get("prompt_tokens"), "avg"),
+        ("Output tokens", telemetry.get("output_tokens"), "avg"),
     ]
     return [
         {"parameter": name, "value": _display_value(value), "unit": unit}
@@ -1108,6 +1807,9 @@ def _simulate_varied_case(
 def _aggregate_gpu_rack(rack_id: str, gpus: list[dict[str, Any]]) -> dict[str, Any]:
     risks = [gpu["forecast"]["risk"] for gpu in gpus]
     temps = [float(gpu["telemetry"]["gpu_temp_c"]) for gpu in gpus if _is_number(gpu["telemetry"].get("gpu_temp_c"))]
+    loads = [float(gpu["telemetry"].get("assigned_traffic_pct") or 0.0) for gpu in gpus]
+    headrooms = [float(gpu["telemetry"].get("alternative_capacity_pct") or 0.0) for gpu in gpus]
+    queues = [int(gpu["telemetry"].get("inference_queue_len") or 0) for gpu in gpus]
     rack_temp_c = round(sum(temps) / len(temps), 2) if temps else None
     if rack_temp_c is not None and rack_temp_c > 80.0:
         rack_temp_state = "CRITICAL"
@@ -1142,6 +1844,9 @@ def _aggregate_gpu_rack(rack_id: str, gpus: list[dict[str, Any]]) -> dict[str, A
         "rack_temp_state": rack_temp_state,
         "max_gpu_temp_c": round(max(temps), 2) if temps else None,
         "avg_gpu_temp_c": rack_temp_c,
+        "avg_assigned_traffic_pct": round(sum(loads) / len(loads), 1) if loads else 0.0,
+        "safe_headroom_pct": round(sum(headrooms), 1),
+        "queued_jobs": sum(queues),
         "top_gpu_id": top_gpu["telemetry"].get("gpu_id"),
         "top_risk": top_gpu["forecast"]["risk"],
         "dominant_cause": top_gpu["diagnosis"]["likely_cause"],

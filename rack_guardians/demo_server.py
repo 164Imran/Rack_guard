@@ -29,9 +29,12 @@ from agent import (  # noqa: E402
     RackTelemetry,
     build_demo_case,
     build_gpu_fleet,
+    build_inference_fleet,
     build_simulated_fleet,
     evaluate_rack,
+    execute_migration_plan,
     prediction_table,
+    propose_migration_plan,
     simulate_mitigation,
     telemetry_table,
 )
@@ -406,6 +409,32 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 800;
       cursor: pointer;
     }
+    .link-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 12px 0 0;
+    }
+    .message.plan {
+      border-color: #bdd5ff;
+      background: #f7faff;
+    }
+    .message.success {
+      border-color: #b8dcbc;
+      background: #f3fbf4;
+    }
+    .message.warning {
+      border-color: #f1d19a;
+      background: #fffaf0;
+    }
+    button.approve-btn {
+      margin-top: 10px;
+      background: var(--blue);
+    }
+    .guardrails {
+      margin: 10px 0 0;
+      padding-left: 18px;
+    }
     .modal-backdrop {
       display: none;
       position: fixed;
@@ -530,7 +559,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="top-actions">
       <label class="toggle"><input id="useCrusoe" type="checkbox" checked /> Nemotron evidence review</label>
-      <button id="simulateBtn">Simulate Telemetry</button>
+      <button id="simulateBtn">Simulate Inference Workload</button>
       <span id="status" class="subtle">Ready</span>
     </div>
   </header>
@@ -613,6 +642,7 @@ INDEX_HTML = r"""<!doctype html>
     let racks = [];
     let selectedRack = null;
     let selectedGpu = null;
+    let workloadDemand = null;
     let activeTab = "forecast";
     let viewMode = "racks";
 
@@ -625,7 +655,7 @@ INDEX_HTML = r"""<!doctype html>
 
     async function simulateFleet() {
       $("simulateBtn").disabled = true;
-      setStatus("Simulating 3 racks x 8 GPUs...");
+      setStatus("Simulating inference demand, scheduler placement, and GPU telemetry...");
       try {
         const response = await fetch("/api/simulate", {
           method: "POST",
@@ -635,6 +665,7 @@ INDEX_HTML = r"""<!doctype html>
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Simulation failed");
         racks = data.racks || [];
+        workloadDemand = data.workload || null;
         selectedRack = null;
         selectedGpu = null;
         viewMode = "racks";
@@ -643,7 +674,7 @@ INDEX_HTML = r"""<!doctype html>
         renderTables(null);
         renderChat(null);
         $("detailsBtn").disabled = true;
-        setStatus("Telemetry simulated at " + new Date(data.generated_at).toLocaleTimeString());
+        setStatus("Inference workload simulated at " + new Date(data.generated_at).toLocaleTimeString());
       } catch (err) {
         setStatus(err.message || String(err));
       } finally {
@@ -654,13 +685,17 @@ INDEX_HTML = r"""<!doctype html>
     function renderSummary() {
       const allGpus = racks.flatMap((rack) => rack.gpus || []);
       const critical = allGpus.filter((gpu) => gpu.forecast.risk === "CRITICAL").length;
-      const watchHigh = allGpus.filter((gpu) => gpu.forecast.risk === "WATCH" || gpu.forecast.risk === "HIGH").length;
       const safe = allGpus.filter((gpu) => gpu.forecast.risk === "SAFE").length;
+      const totalHeadroom = allGpus.reduce((sum, gpu) => sum + Number(gpu.telemetry.alternative_capacity_pct || 0), 0);
       $("summary").innerHTML = [
         metric("Physical Racks", racks.length),
         metric("Total GPUs", allGpus.length),
         metric("Critical GPUs", critical),
         metric("Safe GPUs", safe),
+        metric("Inference Request", workloadDemand ? cleanLabel(workloadDemand.request_type) : "none"),
+        metric("Queued Jobs", workloadDemand ? workloadDemand.queued_jobs : "none"),
+        metric("Demand Units", workloadDemand ? num(workloadDemand.demand_units, 0) : "none"),
+        metric("Safe Headroom", num(totalHeadroom, 0) + "%"),
       ].join("");
     }
 
@@ -695,6 +730,9 @@ INDEX_HTML = r"""<!doctype html>
             <div class="rack-lines">
               <span>Critical GPUs: ${rack.critical_count}/${rack.gpu_count}</span>
               <span>Watch/High GPUs: ${rack.watch_count + rack.high_count}/${rack.gpu_count}</span>
+              <span>Avg assigned traffic: ${num(rack.avg_assigned_traffic_pct, 0)}%</span>
+              <span>Safe headroom: ${num(rack.safe_headroom_pct, 0)}%</span>
+              <span>Queued jobs: ${rack.queued_jobs || 0}</span>
               <span>Max GPU temp: ${num(rack.max_gpu_temp_c, 1)} C</span>
               <span>Top GPU: ${escapeHtml(rack.top_gpu_id || "none")} (${rack.top_risk})</span>
             </div>
@@ -727,6 +765,9 @@ INDEX_HTML = r"""<!doctype html>
             <div class="temp">${num(t.gpu_temp_c, 1)} C</div>
             <div class="rack-lines">
               <span>Peak forecast: ${num(f.peak_temp_c, 1)} C</span>
+              <span>Assigned traffic: ${num(t.assigned_traffic_pct, 0)}%</span>
+              <span>Safe headroom: ${num(t.alternative_capacity_pct, 0)}%</span>
+              <span>Queue: ${t.inference_queue_len || 0} jobs</span>
               <span>Threshold: ${f.time_to_threshold_s === null ? "not in horizon" : secondsLabel(f.time_to_threshold_s)}</span>
               <span>${cleanCause(d.likely_cause)}</span>
             </div>
@@ -790,7 +831,7 @@ INDEX_HTML = r"""<!doctype html>
         $("messages").innerHTML = `
           <div class="message">
             <div class="message-title">Workflow</div>
-            <div>Click <strong>Simulate Telemetry</strong>, open a rack, then select a GPU. The diagnosis and recommendation will appear here. Use <strong>Details</strong> for forecast, action score, and report.</div>
+            <div>Click <strong>Simulate Inference Workload</strong> to generate an inference request, scheduler placement, telemetry, and forecast. Open a rack, then select a GPU for diagnosis and actions.</div>
           </div>
         `;
         return;
@@ -799,6 +840,10 @@ INDEX_HTML = r"""<!doctype html>
       const f = item.forecast;
       const d = item.diagnosis;
       const action = item.recommendation.primary_action;
+      const migrationCandidate = (item.recommendation.candidates || []).find((candidate) => candidate.action_id === "migrate_inference_traffic");
+      const migrationControl = migrationCandidate && f.risk !== "SAFE"
+        ? `<button class="link-btn" id="prepareMigration">Prepare migration plan</button>`
+        : "";
       $("chatTitle").textContent = t.rack_id.toUpperCase() + " / " + t.gpu_id.toUpperCase();
       $("chatSub").textContent = "Risk " + f.risk + " | " + cleanCause(item.simulated_case || d.likely_cause);
       const crossing = f.time_to_threshold_s === null ? "No threshold crossing in horizon" : "Threshold in " + secondsLabel(f.time_to_threshold_s);
@@ -809,6 +854,8 @@ INDEX_HTML = r"""<!doctype html>
           <div class="chips">
             <span class="chip">Current ${num(t.gpu_temp_c, 1)} C</span>
             <span class="chip">Peak ${num(f.peak_temp_c, 1)} C</span>
+            <span class="chip">Assigned ${num(t.assigned_traffic_pct, 0)}%</span>
+            <span class="chip">Headroom ${num(t.alternative_capacity_pct, 0)}%</span>
             <span class="chip">${crossing}</span>
           </div>
         </div>
@@ -824,10 +871,15 @@ INDEX_HTML = r"""<!doctype html>
             <span class="chip">Score ${action.score}</span>
             <span class="chip">Cost ${escapeHtml(action.operational_cost)}</span>
           </div>
-          <p><button class="link-btn" id="viewActions">Explain action score</button></p>
+          <div class="link-row">
+            <button class="link-btn" id="viewActions">Explain action score</button>
+            ${migrationControl}
+          </div>
         </div>
       `;
       $("viewActions").addEventListener("click", () => openModal("actions"));
+      const migrationButton = $("prepareMigration");
+      if (migrationButton) migrationButton.addEventListener("click", prepareMigrationPlan);
     }
 
     async function runAnalysis() {
@@ -894,6 +946,154 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Mitigation simulated.");
     }
 
+    async function prepareMigrationPlan() {
+      if (!selectedGpu) return;
+      const button = $("prepareMigration");
+      if (button) button.disabled = true;
+      setStatus("Searching for safe target GPU capacity...");
+      try {
+        const response = await fetch("/api/propose-migration", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({source: selectedGpu, racks})
+        });
+        const plan = await response.json();
+        if (!response.ok) throw new Error(plan.error || "Migration planning failed");
+        if (!plan.available) {
+          const scale = plan.scale_recommendation || {};
+          appendHtmlMessage("warning", `
+            <div class="message-title">No Safe Migration Target</div>
+            <div>${escapeHtml(plan.reason || "No safe target capacity is available right now.")}</div>
+            <div class="chips">
+              <span class="chip">Source ${escapeHtml(plan.source.rack_id || "")} / ${escapeHtml(plan.source.gpu_id || "")}</span>
+              <span class="chip">Recommended: ${escapeHtml(scale.label || "Add GPU rack capacity")}</span>
+              <span class="chip">Extra racks: ${scale.additional_racks_needed || 0}</span>
+            </div>
+          `);
+          setStatus("No safe migration target found.");
+          return;
+        }
+        appendMigrationPlan(plan);
+        setStatus("Migration plan ready for approval.");
+      } catch (err) {
+        setStatus(err.message || String(err));
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
+    function appendMigrationPlan(plan) {
+      const basis = plan.basis || {};
+      const targetRows = (plan.targets || []).map((target) => `
+        <tr>
+          <td>${escapeHtml(target.rack_id)} / ${escapeHtml(target.gpu_id)}</td>
+          <td>${escapeHtml(target.risk)}</td>
+          <td>${num(target.current_temp_c, 1)} C</td>
+          <td>${num(target.assigned_traffic_pct, 0)}%</td>
+          <td>${num(target.available_capacity_pct, 0)}%</td>
+          <td>${num(target.traffic_share_pct, 0)}%</td>
+        </tr>
+      `).join("");
+      const guardrails = (plan.guardrails || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+      const html = `
+        <div class="message-title">Migration Plan Awaiting Approval</div>
+        <div>Move <strong>${num(plan.traffic_percent, 0)}%</strong> of high-compute inference traffic away from <strong>${escapeHtml(plan.source.rack_id)} / ${escapeHtml(plan.source.gpu_id)}</strong>.</div>
+        <div class="chips">
+          <span class="chip">Risk ${escapeHtml(plan.expected.before.risk)} to ${escapeHtml(plan.expected.after.risk)}</span>
+          <span class="chip">Peak ${num(plan.expected.before.peak_temp_c, 1)} C to ${num(plan.expected.after.peak_temp_c, 1)} C</span>
+          <span class="chip">Source excess ${num(basis.source_excess_pct, 0)}%</span>
+          <span class="chip">Target headroom ${num(basis.target_safe_headroom_pct, 0)}%</span>
+        </div>
+        <div class="subtle" style="margin-top:8px">${escapeHtml(basis.formula || "Traffic percent is based on source overload and target headroom.")}</div>
+        <div style="height:10px"></div>
+        <table>
+          <thead><tr><th>Target GPU</th><th>Risk</th><th>Current</th><th>Assigned</th><th>Headroom</th><th>Traffic</th></tr></thead>
+          <tbody>${targetRows}</tbody>
+        </table>
+        <ul class="guardrails">${guardrails}</ul>
+        <button class="approve-btn">Approve simulated migration</button>
+      `;
+      const div = appendHtmlMessage("plan", html);
+      const approveButton = div.querySelector("button.approve-btn");
+      approveButton.addEventListener("click", () => approveMigration(plan, approveButton));
+    }
+
+    async function approveMigration(plan, button) {
+      if (!selectedGpu) return;
+      if (button) button.disabled = true;
+      let completed = false;
+      setStatus("Engineer approved. Simulating migration...");
+      try {
+        const response = await fetch("/api/execute-migration", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({source: selectedGpu, plan, racks})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Migration execution failed");
+        if (!data.executed) {
+          appendMessage("assistant", data.reason || "Migration was not executed.");
+          setStatus("Migration not executed.");
+          return;
+        }
+        if (data.updated_result) {
+          data.updated_result.last_migration = {
+            approved_at: data.approved_at,
+            traffic_percent: data.traffic_percent,
+            before: data.before,
+            after: data.after,
+            targets: data.targets
+          };
+          replaceGpuResult(data.updated_result);
+          selectedGpu = data.updated_result;
+        }
+        (data.target_updates || []).forEach((targetUpdate) => replaceGpuResult(targetUpdate));
+        if (data.updated_result || (data.target_updates || []).length) {
+          refreshFleetViewAfterMutation();
+        }
+        appendHtmlMessage("success", `
+          <div class="message-title">Migration Approved And Simulated</div>
+          <div>The selected GPU forecast has been updated with the approved post-migration prediction.</div>
+          <div class="chips">
+            <span class="chip">Moved ${num(data.traffic_percent, 0)}%</span>
+            <span class="chip">Risk ${escapeHtml(data.before.risk)} to ${escapeHtml(data.after.risk)}</span>
+            <span class="chip">Peak ${num(data.before.peak_temp_c, 1)} C to ${num(data.after.peak_temp_c, 1)} C</span>
+          </div>
+        `);
+        completed = true;
+        if (button) button.textContent = "Approved";
+        setStatus("Post-migration prediction applied.");
+      } catch (err) {
+        setStatus(err.message || String(err));
+      } finally {
+        if (button && !completed) button.disabled = false;
+      }
+    }
+
+    function replaceGpuResult(updatedGpu) {
+      if (!updatedGpu || !updatedGpu.telemetry) return;
+      const rack = racks.find((item) => item.rack_id === updatedGpu.telemetry.rack_id);
+      if (!rack) return;
+      const idx = rack.gpus.findIndex((gpu) => gpu.telemetry.gpu_id === updatedGpu.telemetry.gpu_id);
+      if (idx >= 0) rack.gpus[idx] = updatedGpu;
+      recomputeRack(rack);
+      if (selectedRack && selectedRack.rack_id === rack.rack_id) selectedRack = rack;
+    }
+
+    function refreshFleetViewAfterMutation() {
+      if (selectedRack) recomputeRack(selectedRack);
+      renderSummary();
+      renderMap();
+      renderTables(selectedGpu);
+      $("chatTitle").textContent = selectedGpu.telemetry.rack_id.toUpperCase() + " / " + selectedGpu.telemetry.gpu_id.toUpperCase();
+      $("chatSub").textContent = "Risk " + selectedGpu.forecast.risk + " | post-migration forecast";
+      if ($("modalBackdrop").classList.contains("open")) {
+        $("modalTitle").textContent = selectedGpu.telemetry.rack_id.toUpperCase() + " / " + selectedGpu.telemetry.gpu_id.toUpperCase();
+        $("modalSub").textContent = selectedGpu.forecast.risk + " | post-migration forecast";
+        renderModalBody();
+      }
+    }
+
     function openModal(tabName) {
       if (!selectedGpu) return;
       activeTab = tabName || activeTab;
@@ -918,7 +1118,7 @@ INDEX_HTML = r"""<!doctype html>
           ${infoCard("Current GPU", num(f.current_temp_c, 1) + " C")}
           ${infoCard("Forecast Peak", num(f.peak_temp_c, 1) + " C")}
           ${infoCard("Time To Threshold", f.time_to_threshold_s === null ? "None" : secondsLabel(f.time_to_threshold_s))}
-          ${infoCard("Prediction Source", selectedGpu.prediction_source === "node_checkpoint" ? "Neural ODE" : "Simulator placeholder")}
+          ${infoCard("Prediction Source", predictionSourceLabel(selectedGpu.prediction_source))}
         </div>
         <div style="height:14px"></div>
         <canvas id="chart" width="1200" height="520"></canvas>
@@ -972,7 +1172,8 @@ INDEX_HTML = r"""<!doctype html>
               <tr><th>Input</th><th>Value</th></tr>
               <tr><td>GPU risk</td><td>${selectedGpu.forecast.risk}</td></tr>
               <tr><td>Diagnosis confidence</td><td>${Math.round(selectedGpu.diagnosis.confidence * 100)}%</td></tr>
-              <tr><td>Alternative capacity</td><td>${num(telemetry.alternative_capacity_pct, 0)}%</td></tr>
+              <tr><td>Safe traffic headroom</td><td>${num(telemetry.alternative_capacity_pct, 0)}%</td></tr>
+              <tr><td>Assigned inference traffic</td><td>${num(telemetry.assigned_traffic_pct, 0)}%</td></tr>
               <tr><td>Latency tolerance</td><td>${num(telemetry.latency_tolerance_ms, 0)} ms</td></tr>
               <tr><td>Expected impact</td><td>${escapeHtml(candidate.expected_impact)}</td></tr>
             </table>
@@ -992,6 +1193,11 @@ INDEX_HTML = r"""<!doctype html>
       rack.avg_gpu_temp_c = temps.length ? temps.reduce((a, b) => a + b, 0) / temps.length : null;
       rack.rack_temp_c = rack.avg_gpu_temp_c;
       rack.rack_temp_state = rack.rack_temp_c > 80 ? "CRITICAL" : (rack.rack_temp_c >= 50 ? "MEDIUM" : "SAFE");
+      const loads = rack.gpus.map((gpu) => Number(gpu.telemetry.assigned_traffic_pct || 0));
+      const headrooms = rack.gpus.map((gpu) => Number(gpu.telemetry.alternative_capacity_pct || 0));
+      rack.avg_assigned_traffic_pct = loads.length ? loads.reduce((a, b) => a + b, 0) / loads.length : 0;
+      rack.safe_headroom_pct = headrooms.reduce((a, b) => a + b, 0);
+      rack.queued_jobs = rack.gpus.reduce((sum, gpu) => sum + Number(gpu.telemetry.inference_queue_len || 0), 0);
       const halfGpuCount = rack.gpus.length / 2;
       rack.rack_state = rack.critical_count > halfGpuCount ? "CRITICAL" : (rack.critical_count === halfGpuCount ? "MEDIUM" : "SAFE");
       const top = [...rack.gpus].sort((a, b) => (riskRank[b.forecast.risk] - riskRank[a.forecast.risk]) || (b.forecast.peak_temp_c - a.forecast.peak_temp_c))[0];
@@ -1006,6 +1212,15 @@ INDEX_HTML = r"""<!doctype html>
       div.textContent = text;
       $("messages").appendChild(div);
       $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    function appendHtmlMessage(tone, html) {
+      const div = document.createElement("div");
+      div.className = "message " + (tone || "");
+      div.innerHTML = html;
+      $("messages").appendChild(div);
+      $("messages").scrollTop = $("messages").scrollHeight;
+      return div;
     }
 
     function fileToDataUrl(input) {
@@ -1112,6 +1327,21 @@ INDEX_HTML = r"""<!doctype html>
       return escapeHtml(String(value || "").replaceAll("_", " "));
     }
 
+    function cleanLabel(value) {
+      return escapeHtml(String(value || "").replaceAll("_", " "));
+    }
+
+    function predictionSourceLabel(value) {
+      const labels = {
+        node_checkpoint: "Neural ODE",
+        simulator_forecast_placeholder: "Simulator placeholder",
+        workload_driven_thermal_simulation: "Workload-driven simulation",
+        post_migration_simulation: "Post-migration simulation",
+        post_migration_target_load: "Post-migration target load",
+      };
+      return labels[value] || cleanLabel(value || "simulation");
+    }
+
     function formatRackState(value) {
       const labels = {CRITICAL: "Critical", MEDIUM: "Medium", SAFE: "Safe"};
       return labels[value] || value;
@@ -1194,6 +1424,12 @@ class RackGuardianHandler(BaseHTTPRequestHandler):
             if self.path == "/api/analyze":
                 self._send_json(self._handle_analyze(body))
                 return
+            if self.path == "/api/propose-migration":
+                self._send_json(propose_migration_plan(body["source"], body.get("racks", [])))
+                return
+            if self.path == "/api/execute-migration":
+                self._send_json(execute_migration_plan(body["source"], body["plan"], body.get("racks")))
+                return
             if self.path == "/api/mitigate":
                 self._send_json(simulate_mitigation(body["result"], body.get("action_id")))
                 return
@@ -1213,14 +1449,16 @@ class RackGuardianHandler(BaseHTTPRequestHandler):
         rack_count = int(body.get("rack_count", 3))
         gpus_per_rack = int(body.get("gpus_per_rack", 8))
         seed = body.get("seed")
-        racks = build_gpu_fleet(
+        payload = build_inference_fleet(
             rack_count=max(1, min(rack_count, 8)),
             gpus_per_rack=max(1, min(gpus_per_rack, 16)),
             seed=seed,
         )
+        racks = payload["racks"]
         fleet = [gpu for rack in racks for gpu in rack["gpus"]]
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "workload": payload["workload"],
             "racks": racks,
             "fleet": fleet,
         }
